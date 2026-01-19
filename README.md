@@ -17,3 +17,6 @@ The project is developed step-by-step with a strong focus on reliability and saf
 
 The current target platform is a 3D printed (FDM) model boat used for experimentation and prototyping.
 While the system focuses on reliability and safety, it is not intended for manned vessels.
+
+Parts of the codebase are developed with the assistance of AI tools.
+All generated code is reviewed, understood, and maintained by the project owner.
