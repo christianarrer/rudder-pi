@@ -1,5 +1,8 @@
 package biz.schrottplatz.rudderpi;
 
+import static biz.schrottplatz.rudderpi.util.NetUtil.isValidIPv4;
+import static biz.schrottplatz.rudderpi.util.NetUtil.isValidTcpPort;
+
 import android.Manifest;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -9,38 +12,33 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 
-import com.google.android.material.snackbar.Snackbar;
-
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 
+import android.text.InputFilter;
 import android.util.Log;
 import android.view.View;
 
 import androidx.core.content.ContextCompat;
-import androidx.navigation.NavController;
-import androidx.navigation.Navigation;
-import androidx.navigation.ui.AppBarConfiguration;
-import androidx.navigation.ui.NavigationUI;
 
-import java.io.IOException;
-
-import biz.schrottplatz.rudderpi.databinding.ActivityMainBinding;
-
-import android.view.Menu;
-import android.view.MenuItem;
 import android.widget.Button;
 import android.widget.TextView;
+import android.widget.EditText;
+
 
 public class MainActivity extends AppCompatActivity {
 
     private ActivityResultLauncher<String> fineLocPerm;
     private ActivityResultLauncher<String> camPerm;
-
     private TextView tvStatus;
     private Button btnStart;
     private Button btnStop;
+    private InputFilter filterP4Address;
+    private InputFilter filterTcpPort;
+    private EditText inpRtspRemoteServerIP4;
+    private EditText inpRtspRemoteServerPort;
+    private Button btnApplySettings;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -58,8 +56,63 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         tvStatus = findViewById(R.id.tvStatus);
+
+        inpRtspRemoteServerIP4 = findViewById(R.id.inpRtspRemoteServerIP4);
+        inpRtspRemoteServerPort = findViewById(R.id.inpRtspRemoteServerPort);
+
+        btnApplySettings = findViewById(R.id.btnApplySettings);
+
+        /*
         btnStart = findViewById(R.id.btnStart);
         btnStop  = findViewById(R.id.btnStop);
+         */
+
+        var prefs = getSharedPreferences("app", MODE_PRIVATE);
+
+        String ip = prefs.getString("rtsp_remote_server_ipv4", "");
+        if (!ip.isEmpty()) {
+            inpRtspRemoteServerIP4.setText(ip);
+        }
+
+        int port = prefs.getInt("rtsp_remote_server_port", 8554);
+        inpRtspRemoteServerPort.setText(String.valueOf(port));
+
+        btnApplySettings.setOnClickListener(v -> {
+            String inpIp = inpRtspRemoteServerIP4.getText().toString().trim();
+            String portStr = inpRtspRemoteServerPort.getText().toString().trim();
+
+            boolean ok = true;
+
+            if (!isValidIPv4(inpIp)) {
+                inpRtspRemoteServerIP4.setError("Invalid IPv4-Address");
+                ok = false;
+            } else {
+                inpRtspRemoteServerIP4.setError(null);
+            }
+
+            if (!isValidTcpPort(portStr)) {
+                inpRtspRemoteServerPort.setError("Invalid TCP/UDP-Port (1–65535)");
+                ok = false;
+            } else {
+                inpRtspRemoteServerPort.setError(null);
+            }
+
+            if (!ok) return;
+
+            int inpPort = Integer.parseInt(portStr);
+
+            boolean saved = getSharedPreferences("app", MODE_PRIVATE)
+                    .edit()
+                    .putString("rtsp_remote_server_ipv4", inpIp)
+                    .putInt("rtsp_remote_server_port", inpPort)
+                    .commit(); // <- synchron, Force-Stop-sicher
+
+            if (!saved) {
+                Log.e("UI", "cannot save settings");
+            }
+        });
+
+        /*
         btnStart.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 startVideoService();
@@ -70,6 +123,7 @@ public class MainActivity extends AppCompatActivity {
                 stopVideoService();
             }
         });
+        */
 
         fineLocPerm = registerForActivityResult(
                 new ActivityResultContracts.RequestPermission(),
@@ -135,10 +189,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startVideoService() {
-        String rtspUrl = "rtsp://192.168.10.36:4242/ship";
         Intent i = new Intent(this, VideoService.class);
         i.setAction(VideoService.ACTION_START);
-        i.putExtra(VideoService.EXTRA_RTSP_URL, rtspUrl);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(i);

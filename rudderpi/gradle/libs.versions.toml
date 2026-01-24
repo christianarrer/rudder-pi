@@ -9,7 +9,7 @@ constraintlayout = "2.1.4"
 nanohttpdWebserver = "2.3.1"
 navigationFragment = "2.6.0"
 navigationUi = "2.6.0"
-rtplibrary = "1.5.7"
+rtplibrary = "2.2.2"
 
 [libraries]
 junit = { group = "junit", name = "junit", version.ref = "junit" }
