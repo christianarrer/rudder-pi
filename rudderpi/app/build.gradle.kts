@@ -38,11 +38,11 @@ android {
 
 dependencies {
     //implementation("com.github.pedroSG94:RTSP-Server:1.3.6")
-    implementation("com.github.pedroSG94.rtmp-rtsp-stream-client-java:rtplibrary:2.2.2")
-    implementation(libs.rtplibrary)
     //implementation("com.google.android.exoplayer:exoplayer-ui:2.19.1")
     //implementation("com.github.pedroSG94.RootEncoder:library:2.6.7")
     //implementation("com.github.pedroSG94.RootEncoder:extra-sources:2.6.7")
+    implementation("com.github.pedroSG94.rtmp-rtsp-stream-client-java:rtplibrary:2.2.2")
+    implementation(libs.rtplibrary)
     implementation(libs.nanohttpd.webserver)
     implementation(libs.appcompat)
     implementation(libs.material)
