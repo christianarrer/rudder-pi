@@ -18,6 +18,8 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 
 import android.text.InputFilter;
+import android.text.Layout;
+import android.text.method.ScrollingMovementMethod;
 import android.util.Log;
 import android.view.View;
 
@@ -26,6 +28,12 @@ import androidx.core.content.ContextCompat;
 import android.widget.Button;
 import android.widget.TextView;
 import android.widget.EditText;
+
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
+import java.util.Date;
+import java.util.Deque;
+import java.util.Locale;
 
 
 public class MainActivity extends AppCompatActivity {
@@ -40,17 +48,36 @@ public class MainActivity extends AppCompatActivity {
     private EditText inpRtspRemoteServerIP4;
     private EditText inpRtspRemoteServerPort;
     private Button btnApplySettings;
+    private static final int MAX_LINES = 200;
+    private final Deque<String> statusLines = new ArrayDeque<>();
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (VideoService.ACTION_STATUS.equals(intent.getAction())) {
                 String msg = intent.getStringExtra(VideoService.EXTRA_STATUS_TEXT);
-                tvStatus.setText(msg);
+                addStatusLine(msg);
             }
         }
     };
 
+    private void addStatusLine(String msg) {
+        String ts = new SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+                .format(new Date());
+
+        statusLines.addFirst("[" + ts + "] " + msg);
+
+        while (statusLines.size() > MAX_LINES) {
+            statusLines.removeLast();
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (String line : statusLines) {
+            sb.append(line).append('\n');
+        }
+
+        tvStatus.setText(sb.toString());
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -58,6 +85,7 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         tvStatus = findViewById(R.id.tvStatus);
+        tvStatus.setMovementMethod(new ScrollingMovementMethod());
 
         inpRtspRemoteServerIP4 = findViewById(R.id.inpRtspRemoteServerIP4);
         inpRtspRemoteServerPort = findViewById(R.id.inpRtspRemoteServerPort);
