@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -45,10 +46,11 @@ public class MainActivity extends AppCompatActivity {
         public void onReceive(Context context, Intent intent) {
             if (VideoService.ACTION_STATUS.equals(intent.getAction())) {
                 String msg = intent.getStringExtra(VideoService.EXTRA_STATUS_TEXT);
-                if (msg != null) tvStatus.setText(msg);
+                tvStatus.setText(msg);
             }
         }
     };
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -112,18 +114,8 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        /*
-        btnStart.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                startVideoService();
-            }
-        });
-        btnStop.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                stopVideoService();
-            }
-        });
-        */
+        restoreLastStatus();
+        registerStatusReceiver();
 
         fineLocPerm = registerForActivityResult(
                 new ActivityResultContracts.RequestPermission(),
@@ -152,25 +144,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    @Override
-    protected void onStart() {
-        super.onStart();
-
-        IntentFilter f = new IntentFilter(VideoService.ACTION_STATUS);
-
-        if (android.os.Build.VERSION.SDK_INT >= 33) { // Android 13+
-            registerReceiver(statusReceiver, f, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(statusReceiver, f);
-        }
-    }
-
-    @Override
-    protected void onStop() {
-        unregisterReceiver(statusReceiver);
-        super.onStop();
-    }
-
     private void startTelemetryService() {
         Intent i = new Intent(this, TelemetryService.class);
         i.setAction(TelemetryService.ACTION_START);
@@ -191,7 +164,6 @@ public class MainActivity extends AppCompatActivity {
     private void startVideoService() {
         Intent i = new Intent(this, VideoService.class);
         i.setAction(VideoService.ACTION_START);
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(i);
         } else {
@@ -203,5 +175,33 @@ public class MainActivity extends AppCompatActivity {
         Intent i = new Intent(this, VideoService.class);
         i.setAction(VideoService.ACTION_STOP);
         startService(i);
+    }
+
+    private void registerStatusReceiver() {
+        IntentFilter f = new IntentFilter(VideoService.ACTION_STATUS);
+        if (android.os.Build.VERSION.SDK_INT >= 33) { // Android 13+
+            registerReceiver(statusReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(statusReceiver, f);
+        }
+    }
+
+    private void restoreLastStatus() {
+        SharedPreferences prefs =
+                getSharedPreferences(VideoService.PREFS_NAME, MODE_PRIVATE);
+
+        String lastStatus = prefs.getString(
+                VideoService.PREF_LAST_STATUS,
+                "waiting for status..."
+        );
+
+        tvStatus.setText(lastStatus);
+    }
+
+    protected void onDestroy() {
+        super.onDestroy();
+        try {
+            unregisterReceiver(statusReceiver);
+        } catch (IllegalArgumentException ignored) {}
     }
 }

@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
@@ -18,6 +19,9 @@ import com.pedro.rtsp.utils.ConnectCheckerRtsp;
 import biz.schrottplatz.rudderpi.util.NetUtil;
 
 public class VideoService extends Service {
+
+    public static final String PREFS_NAME = "video_service_prefs";
+    public static final String PREF_LAST_STATUS = "last_status";
 
     public static final String ACTION_START = "biz.schrottplatz.rudderpi.action.VIDEO_START";
     public static final String ACTION_STOP  = "biz.schrottplatz.rudderpi.action.VIDEO_STOP";
@@ -449,7 +453,17 @@ public class VideoService extends Service {
 
     private void postStatus(String msg) {
         Log.i(TAG, msg);
+
+        // 1) Persistenter Status
+        SharedPreferences prefs =
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        prefs.edit()
+                .putString(PREF_LAST_STATUS, msg)
+                .apply();
+
+        // 2) Optional: Live-Update für UI
         Intent i = new Intent(ACTION_STATUS);
+        i.setPackage(getPackageName()); // app-intern
         i.putExtra(EXTRA_STATUS_TEXT, msg);
         sendBroadcast(i);
     }
