@@ -10,8 +10,9 @@ android {
 
     defaultConfig {
         applicationId = "biz.schrottplatz.rudderpi"
-        minSdk = 34
-        targetSdk = 36
+        minSdk = 26
+        targetSdk = 34
+        compileSdk = 34
         versionCode = 1
         versionName = "1.0"
 
@@ -41,7 +42,7 @@ dependencies {
     //implementation("com.google.android.exoplayer:exoplayer-ui:2.19.1")
     //implementation("com.github.pedroSG94.RootEncoder:library:2.6.7")
     //implementation("com.github.pedroSG94.RootEncoder:extra-sources:2.6.7")
-    implementation("com.github.pedroSG94.rtmp-rtsp-stream-client-java:rtplibrary:2.2.2")
+    //implementation("com.github.pedroSG94.rtmp-rtsp-stream-client-java:rtplibrary:2.2.2")
     implementation(libs.rtplibrary)
     implementation(libs.nanohttpd.webserver)
     implementation(libs.appcompat)

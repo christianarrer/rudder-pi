@@ -155,20 +155,24 @@ public class MainActivity extends AppCompatActivity {
                 granted -> startVideoService()
         );
 
-        if((ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                == PackageManager.PERMISSION_GRANTED) && (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED)) {
+        boolean hasLocation =
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED;
+
+        boolean hasCamera =
+                ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                        == PackageManager.PERMISSION_GRANTED;
+
+        if (hasLocation && hasCamera) {
             startTelemetryService();
             startVideoService();
-        }
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                != PackageManager.PERMISSION_GRANTED) {
-            fineLocPerm.launch(Manifest.permission.ACCESS_FINE_LOCATION);
-        }
-        if(ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                != PackageManager.PERMISSION_GRANTED) {
-            camPerm.launch(Manifest.permission.CAMERA);
+        } else {
+            if (!hasLocation) {
+                fineLocPerm.launch(Manifest.permission.ACCESS_FINE_LOCATION);
+            }
+            if (!hasCamera) {
+                camPerm.launch(Manifest.permission.CAMERA);
+            }
         }
     }
 
