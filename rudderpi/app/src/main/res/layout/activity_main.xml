@@ -9,16 +9,41 @@
     android:background="@android:color/black">
 
     <TextView
-        android:id="@+id/tvRtspSettingsHeader"
-        android:layout_width="wrap_content"
+        android:id="@+id/tvHTTPServerHeader"
+        android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:text="RTSP Settings"
+        android:text="HTTP Server Settings"
         android:textSize="18sp"
         android:textStyle="bold"
         android:textColor="@android:color/white"
         android:layout_marginTop="24dp"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent" />
+
+    <EditText
+        android:id="@+id/inpHTTPServerXAuthHeaderPassword"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:hint="HTTP Server X-Auth Header Password"
+        app:layout_constraintTop_toBottomOf="@id/tvHTTPServerHeader"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_marginTop="12dp"
+        android:inputType="text"
+        android:digits="abcdefghijklmnopqrstuvwxyz0123456789" />
+
+    <TextView
+        android:id="@+id/tvRtspSettingsHeader"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="RTSP Client Settings"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textColor="@android:color/white"
+        android:layout_marginTop="24dp"
+        app:layout_constraintTop_toBottomOf="@id/inpHTTPServerXAuthHeaderPassword"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <EditText
         android:id="@+id/inpRtspRemoteServerIP4"
@@ -38,16 +63,16 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
         android:hint="RTSP Remote Upstream Server Port"
+        app:layout_constraintTop_toBottomOf="@id/inpRtspRemoteServerIP4"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintTop_toBottomOf="@id/inpRtspRemoteServerIP4"
         android:digits="0123456789" />
 
     <Button
         android:id="@+id/btnApplySettings"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:text="Apply"
+        android:text="Apply all settings"
         app:layout_constraintTop_toBottomOf="@id/inpRtspRemoteServerPort"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"

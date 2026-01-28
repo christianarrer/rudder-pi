@@ -38,13 +38,11 @@ import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
-    private ActivityResultLauncher<String> fineLocPerm;
-    private ActivityResultLauncher<String> camPerm;
+    private ActivityResultLauncher<String> permLauncher;
+    private final ArrayDeque<String> permQueue = new ArrayDeque<>();
+    private boolean permFlowRunning = false;
     private TextView tvStatus;
-    private Button btnStart;
-    private Button btnStop;
-    private InputFilter filterP4Address;
-    private InputFilter filterTcpPort;
+    private EditText inpHTTPServerXAuthHeaderPassword;
     private EditText inpRtspRemoteServerIP4;
     private EditText inpRtspRemoteServerPort;
     private Button btnApplySettings;
@@ -87,19 +85,20 @@ public class MainActivity extends AppCompatActivity {
         tvStatus = findViewById(R.id.tvStatus);
         tvStatus.setMovementMethod(new ScrollingMovementMethod());
 
+        inpHTTPServerXAuthHeaderPassword = findViewById(R.id.inpHTTPServerXAuthHeaderPassword);
         inpRtspRemoteServerIP4 = findViewById(R.id.inpRtspRemoteServerIP4);
         inpRtspRemoteServerPort = findViewById(R.id.inpRtspRemoteServerPort);
 
         btnApplySettings = findViewById(R.id.btnApplySettings);
 
-        /*
-        btnStart = findViewById(R.id.btnStart);
-        btnStop  = findViewById(R.id.btnStop);
-         */
-
         var prefs = getSharedPreferences("app", MODE_PRIVATE);
 
-        String ip = prefs.getString("rtsp_remote_server_ipv4", "");
+        String pw = prefs.getString("http_server_xauth_header_password", "rudderpi");
+        if (!pw.isEmpty()) {
+            inpHTTPServerXAuthHeaderPassword.setText(pw);
+        }
+
+        String ip = prefs.getString("rtsp_remote_server_ipv4", "192.168.0.1");
         if (!ip.isEmpty()) {
             inpRtspRemoteServerIP4.setText(ip);
         }
@@ -108,11 +107,16 @@ public class MainActivity extends AppCompatActivity {
         inpRtspRemoteServerPort.setText(String.valueOf(port));
 
         btnApplySettings.setOnClickListener(v -> {
+            String pwStr = inpHTTPServerXAuthHeaderPassword.getText().toString().trim();
             String inpIp = inpRtspRemoteServerIP4.getText().toString().trim();
             String portStr = inpRtspRemoteServerPort.getText().toString().trim();
 
             boolean ok = true;
 
+            if (pwStr.isEmpty()) {
+                inpHTTPServerXAuthHeaderPassword.setError("Required");
+                ok = false;
+            }
             if (!isValidIPv4(inpIp)) {
                 inpRtspRemoteServerIP4.setError("Invalid IPv4-Address");
                 ok = false;
@@ -133,6 +137,7 @@ public class MainActivity extends AppCompatActivity {
 
             boolean saved = getSharedPreferences("app", MODE_PRIVATE)
                     .edit()
+                    .putString("http_server_xauth_header_password", pwStr)
                     .putString("rtsp_remote_server_ipv4", inpIp)
                     .putInt("rtsp_remote_server_port", inpPort)
                     .commit(); // <- synchron, Force-Stop-sicher
@@ -145,40 +150,61 @@ public class MainActivity extends AppCompatActivity {
         restoreLastStatus();
         registerStatusReceiver();
 
-        fineLocPerm = registerForActivityResult(
+        permLauncher = registerForActivityResult(
                 new ActivityResultContracts.RequestPermission(),
                 granted -> {
-                    if (granted) startTelemetryService();
-                    // oder: maybeStartServices();
+                    // Optional: wenn abgelehnt -> Hinweis anzeigen, aber trotzdem fortsetzen,
+                    // sonst hängt man fest.
+                    requestNextPermissionOrStart();
                 }
         );
 
-        camPerm = registerForActivityResult(
-                new ActivityResultContracts.RequestPermission(),
-                granted -> {
-                    if (granted) startVideoService();
-                    // oder: maybeStartServices();
-                }
-        );
+        // Beim ersten Start einmal sauber abarbeiten:
+        runPermissionFlow();
+    }
 
+    private void runPermissionFlow() {
+        if (permFlowRunning) return;
+        permFlowRunning = true;
+
+        permQueue.clear();
+
+        // Reihenfolge festlegen:
+        // 1) Notifications (Android 13+)
         if (Build.VERSION.SDK_INT >= 33) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                     != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1001);
+                permQueue.add(Manifest.permission.POST_NOTIFICATIONS);
             }
         }
 
-        boolean hasLocation =
-                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-                        == PackageManager.PERMISSION_GRANTED;
+        // 2) Location
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            permQueue.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        }
 
-        boolean hasCamera =
-                ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                        == PackageManager.PERMISSION_GRANTED;
+        // 3) Camera
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            permQueue.add(Manifest.permission.CAMERA);
+        }
 
-        if (!hasLocation) fineLocPerm.launch(Manifest.permission.ACCESS_FINE_LOCATION);
-        if (!hasCamera) camPerm.launch(Manifest.permission.CAMERA);
+        requestNextPermissionOrStart();
+    }
 
+    private void requestNextPermissionOrStart() {
+        // nächste fehlende Permission suchen (Queue kann inzwischen veraltet sein)
+        while (!permQueue.isEmpty()) {
+            String p = permQueue.removeFirst();
+            if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
+                permLauncher.launch(p);
+                return; // wichtig: immer nur EIN Dialog gleichzeitig
+            }
+        }
+
+        // Fertig: alle abgearbeitet
+        permFlowRunning = false;
         maybeStartServices();
     }
 

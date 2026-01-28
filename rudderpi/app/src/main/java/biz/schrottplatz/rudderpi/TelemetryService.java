@@ -140,8 +140,7 @@ public class TelemetryService extends Service implements SensorEventListener {
     private void startHttpServer() {
         if (server != null) return;
 
-        String token = "rudderpi123"; // TODO: später aus Settings
-        server = new HttpServer(8080, this, token);
+        server = new HttpServer(8080, this);
         try {
             server.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false);
         } catch (IOException e) {

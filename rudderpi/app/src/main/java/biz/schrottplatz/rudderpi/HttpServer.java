@@ -1,24 +1,30 @@
 package biz.schrottplatz.rudderpi;
 
+import static android.content.Context.MODE_PRIVATE;
+
+import android.content.Context;
 import android.util.Log;
 
 import fi.iki.elonen.NanoHTTPD;
+import android.content.SharedPreferences;
 
 public class HttpServer extends NanoHTTPD {
 
     private final TelemetryService telemetryService;
-    private final String authToken; // optional
 
-    public HttpServer(int port, TelemetryService svc, String authToken) {
+
+    public HttpServer(int port, TelemetryService svc) {
         super(port);
         this.telemetryService = svc;
-        this.authToken = authToken;
     }
 
     private boolean isAuthorized(IHTTPSession session) {
-        if (authToken == null || authToken.isEmpty()) return true;
-        String h = session.getHeaders().get("x-auth");
-        return authToken.equals(h);
+        if (telemetryService == null) return false; // oder true (aber dann offen!)
+        String expected = telemetryService.getSharedPreferences("app", Context.MODE_PRIVATE)
+                .getString("http_server_xauth_header_password", "");
+        if (expected == null || expected.isEmpty()) return false;
+        String got = session.getHeaders().get("x-auth");
+        return got != null && expected.equals(got);
     }
 
     @Override
