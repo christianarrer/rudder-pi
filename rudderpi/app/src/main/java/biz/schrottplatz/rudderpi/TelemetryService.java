@@ -29,8 +29,18 @@ import com.pedro.rtsp.rtsp.RtspClient;
 import com.pedro.rtsp.utils.ConnectCheckerRtsp;
 
 import fi.iki.elonen.NanoHTTPD;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.IntentFilter;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.os.BatteryManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 
-
+import java.io.IOException;
 
 
 public class TelemetryService extends Service implements SensorEventListener {
@@ -53,6 +63,43 @@ public class TelemetryService extends Service implements SensorEventListener {
     // Für Heading-Berechnung:
     private float[] lastAccel = null;
     private float[] lastMag = null;
+
+    // --- Device Info ---
+    private BroadcastReceiver batteryReceiver;
+    private Handler deviceHandler;
+    private Runnable devicePoller;
+
+    private int lastBatteryPct = -1;
+    private boolean lastCharging = false;
+    private float lastTempC = Float.NaN;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+
+        createNotificationChannel();
+        startForeground(1, buildNotification("rudderpi telemetry running"));
+
+        // Optional: jetzt erst initialisieren
+    }
+
+
+    public void requestStartVideo() {
+        // optional: check camera permission bevor du startest
+        Intent svc = new Intent(this, VideoService.class);
+        ContextCompat.startForegroundService(this, svc);
+    }
+
+    public void requestStopVideo() {
+        Intent svc = new Intent(this, VideoService.class);
+        stopService(svc);
+    }
+
+    public boolean isVideoRunning() {
+        // schnell & simpel: VideoService setzt ein static Flag
+        return VideoService.isRunning();
+    }
+
 
     private final LocationListener locationListener = new LocationListener() {
         @Override
@@ -85,6 +132,7 @@ public class TelemetryService extends Service implements SensorEventListener {
         startHttpServer();
         startSensors();
         startLocation();
+        startDeviceInfo();
 
         return START_STICKY;
     }
@@ -92,14 +140,15 @@ public class TelemetryService extends Service implements SensorEventListener {
     private void startHttpServer() {
         if (server != null) return;
 
-        server = new HttpServer(8080);
+        String token = "rudderpi123"; // TODO: später aus Settings
+        server = new HttpServer(8080, this, token);
         try {
             server.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false);
-        } catch (Exception e) {
-            // Wenn Serverstart fehlschlägt, Service stoppen (oder loggen)
-            stopSelf();
+        } catch (IOException e) {
+            e.printStackTrace();
         }
     }
+
 
     private void startSensors() {
         if (sensorManager != null) return;
@@ -152,6 +201,116 @@ public class TelemetryService extends Service implements SensorEventListener {
         }
     }
 
+    private void startDeviceInfo() {
+        if (deviceHandler != null) return;
+
+        deviceHandler = new Handler(Looper.getMainLooper());
+
+        // 1) Battery / Charging / Temp (event-basiert)
+        if (batteryReceiver == null) {
+            batteryReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (intent == null) return;
+
+                    int level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                    int scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                    if (level >= 0 && scale > 0) {
+                        lastBatteryPct = (int) Math.round(level * 100.0 / scale);
+                    }
+
+                    int status = intent.getIntExtra(
+                            BatteryManager.EXTRA_STATUS,
+                            BatteryManager.BATTERY_STATUS_UNKNOWN
+                    );
+                    lastCharging = (status == BatteryManager.BATTERY_STATUS_CHARGING
+                            || status == BatteryManager.BATTERY_STATUS_FULL);
+
+                    int tempTenths = intent.getIntExtra(
+                            BatteryManager.EXTRA_TEMPERATURE,
+                            Integer.MIN_VALUE
+                    );
+                    if (tempTenths != Integer.MIN_VALUE) {
+                        lastTempC = tempTenths / 10.0f;
+                    }
+
+                    // sofort pushen, damit device-Block schnell befüllt ist
+                    publishDeviceState();
+                }
+            };
+
+            IntentFilter f = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            // registerReceiver liefert bei ACTION_BATTERY_CHANGED sofort den aktuellen Intent zurück
+            Intent sticky = registerReceiver(batteryReceiver, f);
+            if (sticky != null) {
+                // einmalig auswerten (damit du nicht auf das nächste Battery-Event warten musst)
+                batteryReceiver.onReceive(this, sticky);
+            }
+        }
+
+        // 2) Network + Uptime periodisch (z.B. alle 5s)
+        devicePoller = new Runnable() {
+            @Override
+            public void run() {
+                publishDeviceState();
+                if (deviceHandler != null) {
+                    deviceHandler.postDelayed(this, 5000L);
+                }
+            }
+        };
+        deviceHandler.post(devicePoller);
+    }
+
+    private void stopDeviceInfo() {
+        // Poller stoppen
+        if (deviceHandler != null && devicePoller != null) {
+            deviceHandler.removeCallbacks(devicePoller);
+        }
+        devicePoller = null;
+        deviceHandler = null;
+
+        // Receiver abmelden
+        if (batteryReceiver != null) {
+            try {
+                unregisterReceiver(batteryReceiver);
+            } catch (IllegalArgumentException ignored) {
+                // falls bereits abgemeldet
+            }
+            batteryReceiver = null;
+        }
+    }
+
+    private void publishDeviceState() {
+        String net = getNetworkTypeSimple();
+        long uptimeS = SystemClock.elapsedRealtime() / 1000L;
+
+        TelemetryState.get().updateDevice(
+                lastBatteryPct,
+                lastCharging,
+                lastTempC,
+                net,
+                uptimeS
+        );
+    }
+
+    private String getNetworkTypeSimple() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        if (cm == null) return "unknown";
+
+        Network n = cm.getActiveNetwork();
+        if (n == null) return "none";
+
+        NetworkCapabilities caps = cm.getNetworkCapabilities(n);
+        if (caps == null) return "unknown";
+
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "wifi";
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "ethernet";
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "cellular";
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return "vpn";
+
+        return "other";
+    }
+
     @Override
     public void onDestroy() {
         super.onDestroy();
@@ -175,6 +334,8 @@ public class TelemetryService extends Service implements SensorEventListener {
             } catch (SecurityException ignored) {}
             locationManager = null;
         }
+
+        stopDeviceInfo();
 
         stopForeground(true);
     }

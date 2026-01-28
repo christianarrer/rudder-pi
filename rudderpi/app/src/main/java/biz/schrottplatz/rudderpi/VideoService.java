@@ -80,6 +80,10 @@ public class VideoService extends Service {
     // ============================================================
     private volatile boolean wantReconnect = true;
 
+    private static volatile boolean RUNNING = false;
+    public static boolean isRunning() { return RUNNING; }
+
+
     // ============================================================
     // 7) RTSP Callback: informiert & weckt Loop auf
     // ============================================================
@@ -166,6 +170,8 @@ public class VideoService extends Service {
     public void onCreate() {
         super.onCreate();
 
+        RUNNING = true;
+
         createNotifChannel();
         startForeground(NOTIF_ID, buildNotification("Starting..."));
 
@@ -199,6 +205,7 @@ public class VideoService extends Service {
         postStatus("VideoService: onDestroy()");
         stopServiceAndThread();
         super.onDestroy();
+        RUNNING = false;
     }
 
     @Nullable

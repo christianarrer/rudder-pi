@@ -147,13 +147,26 @@ public class MainActivity extends AppCompatActivity {
 
         fineLocPerm = registerForActivityResult(
                 new ActivityResultContracts.RequestPermission(),
-                granted -> startTelemetryService()
+                granted -> {
+                    if (granted) startTelemetryService();
+                    // oder: maybeStartServices();
+                }
         );
 
         camPerm = registerForActivityResult(
                 new ActivityResultContracts.RequestPermission(),
-                granted -> startVideoService()
+                granted -> {
+                    if (granted) startVideoService();
+                    // oder: maybeStartServices();
+                }
         );
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1001);
+            }
+        }
 
         boolean hasLocation =
                 ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
@@ -163,18 +176,25 @@ public class MainActivity extends AppCompatActivity {
                 ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                         == PackageManager.PERMISSION_GRANTED;
 
-        if (hasLocation && hasCamera) {
-            startTelemetryService();
-            startVideoService();
-        } else {
-            if (!hasLocation) {
-                fineLocPerm.launch(Manifest.permission.ACCESS_FINE_LOCATION);
-            }
-            if (!hasCamera) {
-                camPerm.launch(Manifest.permission.CAMERA);
-            }
-        }
+        if (!hasLocation) fineLocPerm.launch(Manifest.permission.ACCESS_FINE_LOCATION);
+        if (!hasCamera) camPerm.launch(Manifest.permission.CAMERA);
+
+        maybeStartServices();
     }
+
+    private void maybeStartServices() {
+        boolean hasLocation =
+                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                        == PackageManager.PERMISSION_GRANTED;
+
+        boolean hasCamera =
+                ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                        == PackageManager.PERMISSION_GRANTED;
+
+        if (hasLocation) startTelemetryService();
+        if (hasCamera) startVideoService();
+    }
+
 
     private void startTelemetryService() {
         Intent i = new Intent(this, TelemetryService.class);
