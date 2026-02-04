@@ -1,7 +1,9 @@
 package biz.schrottplatz.rudderpi;
 
-import static biz.schrottplatz.rudderpi.util.NetUtil.isValidIPv4;
-import static biz.schrottplatz.rudderpi.util.NetUtil.isValidTcpPort;
+import static biz.schrottplatz.rudderpi.NetUtil.isValidIPv4;
+import static biz.schrottplatz.rudderpi.NetUtil.isValidTcpPort;
+import static biz.schrottplatz.rudderpi.NetUtil.isValidHostname;
+
 
 import android.Manifest;
 import android.content.BroadcastReceiver;
@@ -117,8 +119,8 @@ public class MainActivity extends AppCompatActivity {
                 inpHTTPServerXAuthHeaderPassword.setError("Required");
                 ok = false;
             }
-            if (!isValidIPv4(inpIp)) {
-                inpRtspRemoteServerIP4.setError("Invalid IPv4-Address");
+            if (!isValidIPv4(inpIp) || !isValidHostname(inpIp)) {
+                inpRtspRemoteServerIP4.setError("Invalid IPv4-Address/Hostname");
                 ok = false;
             } else {
                 inpRtspRemoteServerIP4.setError(null);

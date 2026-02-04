@@ -1,4 +1,4 @@
-package biz.schrottplatz.rudderpi.util;
+package biz.schrottplatz.rudderpi;
 
 public final class NetUtil {
 
@@ -22,6 +22,30 @@ public final class NetUtil {
             catch (NumberFormatException e) { return false; }
             if (v < 0 || v > 255) return false;
         }
+        return true;
+    }
+
+    public static boolean isValidHostname(String hostname) {
+        if (hostname == null) return false;
+        hostname = hostname.trim();
+        if (hostname.isEmpty()) return false;
+
+        // Allow IPv4/IPv6 elsewhere, this is just hostname-ish.
+        // Basic: letters/digits/dot/hyphen, no spaces.
+        if (!hostname.matches("^[A-Za-z0-9.-]+$")) return false;
+
+        // No leading/trailing dot, no double dots
+        if (hostname.startsWith(".") || hostname.endsWith(".")) return false;
+        if (hostname.contains("..")) return false;
+
+        // Each label 1..63, whole name <= 253
+        if (hostname.length() > 253) return false;
+        String[] labels = hostname.split("\\.");
+        for (String label : labels) {
+            if (label.isEmpty() || label.length() > 63) return false;
+            if (label.startsWith("-") || label.endsWith("-")) return false;
+        }
+
         return true;
     }
 

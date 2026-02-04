@@ -1,5 +1,7 @@
 package biz.schrottplatz.rudderpi;
 
+import static biz.schrottplatz.rudderpi.NetUtil.isValidHostname;
+
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -16,7 +18,7 @@ import androidx.core.app.NotificationCompat;
 import com.pedro.rtplibrary.rtsp.RtspCamera2;
 import com.pedro.rtsp.utils.ConnectCheckerRtsp;
 
-import biz.schrottplatz.rudderpi.util.NetUtil;
+import biz.schrottplatz.rudderpi.NetUtil;
 
 public class VideoService extends Service {
 
@@ -278,7 +280,7 @@ public class VideoService extends Service {
             loadRtspSettingsFromPrefs();
 
             // 2) Prüfen, ob Settings gültig sind
-            if (!NetUtil.isValidIPv4(rtspRemoteServerIP4) || !NetUtil.isValidTcpPort(rtspRemoteServerPort)) {
+            if (!NetUtil.isValidIPv4(rtspRemoteServerIP4) || !isValidHostname(rtspRemoteServerIP4) || !NetUtil.isValidTcpPort(rtspRemoteServerPort)) {
                 postStatus("RTSP: waiting for valid settings...");
                 sleepQuiet(1000);
                 continue;
@@ -446,7 +448,7 @@ public class VideoService extends Service {
     private void loadRtspSettingsFromPrefs() {
         // Beispiel:
         String ip = getSharedPreferences("app", MODE_PRIVATE)
-                .getString("rtsp_remote_server_ipv4", "192.168.0.1");
+                .getString("rtsp_remote_server_ipv4", "rudderpi.local");
         if (NetUtil.isValidIPv4(ip)) rtspRemoteServerIP4 = ip;
 
         int port = getSharedPreferences("app", MODE_PRIVATE)
