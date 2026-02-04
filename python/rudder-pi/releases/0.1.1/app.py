@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""
+Gradio control UI for a model boat (mobile-first layout):
+- Manual tab: MediaMTX WebRTC iframe, state.json live view, PWM0/PWM1 sliders stacked vertically
+- Sliders are -100..+100 (intended for ESC throttle with reverse)
+- Soft ramp ("slew") toward target values in the background
+- Single-controller lock so only one browser can drive at a time
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import json
+import uuid
+import threading
+import subprocess
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
+
+import requests
+import gradio as gr
+
+try:
+    import pigpio
+except Exception:
+    pigpio = None  # type: ignore
+
+
+# =========================
+# Config knobs (ESC mapping)
+# =========================
+
+# UI throttle range
+THROTTLE_MIN = -100
+THROTTLE_MAX = 100
+
+# ESC pulse widths in microseconds (adjust as needed)
+# Typical: 1000..1500..2000 us. Your ESC mention: 1000000..1400000..1800000 "ns-ish";
+# with pigpio it's microseconds, so 1000..1400..1800 us is the direct equivalent.
+ESC_PULSE_MIN_US = 1000
+ESC_PULSE_CENTER_US = 1400
+ESC_PULSE_MAX_US = 1800
+
+# Soft ramp behavior
+RAMP_TICK_HZ = 50.0           # how often we step toward target
+MAX_DELTA_PER_TICK = 3.0      # max throttle units per tick (3 at 50Hz -> 150 units/sec)
+
+
+# =========================
+# Backend abstractions
+# =========================
+
+class PWMBackend:
+    """Abstract PWM backend (ESC style)."""
+    def set_pulse_us(self, channel: int, pulse_us: int) -> None:
+        raise NotImplementedError
+
+    def stop(self) -> None:
+        pass
+
+
+class MockPWMBackend(PWMBackend):
+    """Mock backend for WSL/testing."""
+    def __init__(self) -> None:
+        self.last: Dict[int, int] = {}
+
+    def set_pulse_us(self, channel: int, pulse_us: int) -> None:
+        self.last[channel] = int(pulse_us)
+
+
+class PigpioServoBackend(PWMBackend):
+    """
+    ESC pulses using pigpio DMA timing (stable).
+    pigpio expects pulse width in microseconds.
+    """
+    def __init__(self, gpio_map: dict[int, int]) -> None:
+        if pigpio is None:
+            raise RuntimeError("pigpio is not installed.")
+        self.gpio_map = gpio_map
+        self.pi = pigpio.pi()
+        if not self.pi.connected:
+            raise RuntimeError("pigpio daemon not running (pigpiod).")
+        for gpio_num in self.gpio_map.values():
+            self.pi.set_mode(gpio_num, pigpio.OUTPUT)
+            self.pi.set_servo_pulsewidth(gpio_num, 0)  # stop
+
+    def set_pulse_us(self, channel: int, pulse_us: int) -> None:
+        gpio_num = self.gpio_map[channel]
+        self.pi.set_servo_pulsewidth(gpio_num, int(pulse_us))
+
+    def stop(self) -> None:
+        for gpio_num in self.gpio_map.values():
+            self.pi.set_servo_pulsewidth(gpio_num, 0)
+        self.pi.stop()
+
+@dataclass
+class SysfsPwmChannel:
+    chip_path: str  # e.g. /sys/class/pwm/pwmchip0
+    index: int      # 0 or 1
+
+    @property
+    def path(self) -> str:
+        return os.path.join(self.chip_path, f"pwm{self.index}")
+
+    def _write(self, name: str, value: str) -> None:
+        with open(os.path.join(self.path, name), "w", encoding="utf-8") as f:
+            f.write(value)
+
+    def _read(self, name: str) -> str:
+        with open(os.path.join(self.path, name), "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    def ensure_exported(self) -> None:
+        if os.path.isdir(self.path):
+            return
+        export_path = os.path.join(self.chip_path, "export")
+        with open(export_path, "w", encoding="utf-8") as f:
+            f.write(str(self.index))
+        # Wait a tiny bit for sysfs to create pwmN directory
+        for _ in range(50):
+            if os.path.isdir(self.path):
+                return
+            import time
+            time.sleep(0.01)
+        raise RuntimeError(f"PWM channel pwm{self.index} did not appear under sysfs.")
+
+    def disable(self) -> None:
+        self._write("enable", "0")
+
+    def enable(self) -> None:
+        self._write("enable", "1")
+
+    def set_period_ns(self, period_ns: int) -> None:
+        # Many drivers require disabling before period change
+        self.disable()
+        self._write("period", str(period_ns))
+
+    def set_duty_ns(self, duty_ns: int) -> None:
+        self._write("duty_cycle", str(duty_ns))
+
+class SysfsEscBackend(PWMBackend):
+    """
+    ESC-style signal via sysfs PWM.
+    - Fixed 50 Hz (20 ms period)
+    - UI provides signed throttle -100..+100
+    """
+    def __init__(
+        self,
+        chip_path: str = "/sys/class/pwm/pwmchip0",
+        channel_to_index: dict[int, int] = {0: 0, 1: 1},
+        period_ns: int = 20_000_000,
+        min_us: int = 1000,
+        neutral_us: int = 1400,
+        max_us: int = 1800,
+    ) -> None:
+        self.chip_path = chip_path
+        self.period_ns = int(period_ns)
+        self.min_us = int(min_us)
+        self.neutral_us = int(neutral_us)
+        self.max_us = int(max_us)
+
+        self.channels: dict[int, SysfsPwmChannel] = {}
+
+        for logical_ch, idx in channel_to_index.items():
+            ch = SysfsPwmChannel(chip_path, idx)
+            ch.ensure_exported()
+            ch.set_period_ns(self.period_ns)
+            ch.set_duty_ns(self._us_to_ns(self.neutral_us))
+            ch.enable()
+            self.channels[logical_ch] = ch
+
+    @staticmethod
+    def _us_to_ns(us: int) -> int:
+        return int(us) * 1000
+
+    def set_throttle(self, channel: int, value: float) -> None:
+        """
+        value: -100 .. +100
+        """
+        if channel not in self.channels:
+            raise ValueError(f"Unknown PWM channel: {channel}")
+
+        x = max(-100.0, min(100.0, float(value)))
+
+        if x >= 0:
+            us = self.neutral_us + (self.max_us - self.neutral_us) * (x / 100.0)
+        else:
+            us = self.neutral_us + (self.neutral_us - self.min_us) * (x / 100.0)
+
+        duty_ns = self._us_to_ns(int(round(us)))
+
+        if duty_ns < 0:
+            duty_ns = 0
+        if duty_ns > self.period_ns:
+            duty_ns = self.period_ns
+
+        self.channels[channel].set_duty_ns(duty_ns)
+
+    def stop(self) -> None:
+        for ch in self.channels.values():
+            ch.set_duty_ns(self._us_to_ns(self.neutral_us))
+            ch.disable()
+
+
+def build_pwm_backend() -> PWMBackend:
+    is_pi = os.path.exists("/proc/device-tree/model")
+
+    if is_pi and os.path.isdir("/sys/class/pwm/pwmchip0"):
+        return SysfsEscBackend(
+            chip_path="/sys/class/pwm/pwmchip0",
+            channel_to_index={0: 0, 1: 1},
+            period_ns=20_000_000,
+            min_us=1000,
+            neutral_us=1400,
+            max_us=1800,
+        )
+
+    return MockPWMBackend()
+
+
+def throttle_to_pulse_us(throttle: float) -> int:
+    """
+    Map throttle -100..+100 to pulse width:
+      -100 => ESC_PULSE_MIN_US
+        0  => ESC_PULSE_CENTER_US
+      +100 => ESC_PULSE_MAX_US
+    """
+    t = float(throttle)
+    t = max(float(THROTTLE_MIN), min(float(THROTTLE_MAX), t))
+
+    if t >= 0:
+        # 0..+100 -> center..max
+        span = ESC_PULSE_MAX_US - ESC_PULSE_CENTER_US
+        pulse = ESC_PULSE_CENTER_US + (t / 100.0) * span
+    else:
+        # -100..0 -> min..center
+        span = ESC_PULSE_CENTER_US - ESC_PULSE_MIN_US
+        pulse = ESC_PULSE_CENTER_US + (t / 100.0) * span  # t is negative
+    return int(round(pulse))
+
+
+# =========================
+# Single-controller lock
+# =========================
+
+@dataclass
+class ControlLock:
+    controller_id: Optional[str] = None
+    controller_name: Optional[str] = None
+    last_seen: float = 0.0
+    ttl_sec: int = 20
+
+    def is_held(self) -> bool:
+        if not self.controller_id:
+            return False
+        return (time.time() - self.last_seen) <= self.ttl_sec
+
+    def holder_label(self) -> str:
+        if self.is_held():
+            return f"{self.controller_name or 'Unbekannt'} ({self.controller_id[:8]})"
+        return "niemand"
+
+
+LOCK = ControlLock()
+LOCK_MUTEX = threading.Lock()
+
+
+def ensure_lock_cleanup() -> None:
+    with LOCK_MUTEX:
+        if LOCK.controller_id and not LOCK.is_held():
+            LOCK.controller_id = None
+            LOCK.controller_name = None
+            LOCK.last_seen = 0.0
+
+
+def take_control(session_id: str, name: str) -> Tuple[bool, str]:
+    ensure_lock_cleanup()
+    with LOCK_MUTEX:
+        if LOCK.controller_id is None:
+            LOCK.controller_id = session_id
+            LOCK.controller_name = name.strip()[:32] or "Controller"
+            LOCK.last_seen = time.time()
+            return True, f"✅ Control übernommen: {LOCK.holder_label()}"
+        if LOCK.controller_id == session_id:
+            LOCK.last_seen = time.time()
+            return True, f"✅ Du hast bereits Control: {LOCK.holder_label()}"
+        return False, f"⛔ Control ist belegt von: {LOCK.holder_label()}"
+
+
+def release_control(session_id: str) -> str:
+    with LOCK_MUTEX:
+        if LOCK.controller_id == session_id:
+            LOCK.controller_id = None
+            LOCK.controller_name = None
+            LOCK.last_seen = 0.0
+            return "✅ Control freigegeben."
+    return "ℹ️ Du hattest kein Control."
+
+
+def heartbeat(session_id: str) -> str:
+    ensure_lock_cleanup()
+    with LOCK_MUTEX:
+        if LOCK.controller_id == session_id:
+            LOCK.last_seen = time.time()
+            return f"🟢 Control aktiv: {LOCK.holder_label()}"
+        return f"🔒 Control belegt von: {LOCK.holder_label()}"
+
+
+def can_control(session_id: str) -> bool:
+    ensure_lock_cleanup()
+    with LOCK_MUTEX:
+        return LOCK.controller_id == session_id and LOCK.is_held()
+
+
+# =========================
+# state.json polling
+# =========================
+
+STATE_CACHE: Dict[str, Any] = {"ok": False, "ts": 0.0, "data": None, "error": "not loaded"}
+STATE_MUTEX = threading.Lock()
+
+STATE_CFG_MUTEX = threading.Lock()
+STATE_URL = "http://192.168.42.129/state.json"
+STATE_XAUTH = "rudderpi"
+
+def poll_state_forever(interval_sec: float = 1.0) -> None:
+    while True:
+        try:
+            with STATE_CFG_MUTEX:
+                url = STATE_URL
+                pw = STATE_XAUTH
+
+            if not url:
+                raise ValueError("state.json URL is empty")
+            headers = {"X-Auth": pw} if pw else {}
+            r = requests.get(url, headers=headers, timeout=1.5)
+            r.raise_for_status()
+            data = r.json()
+            payload = {"ok": True, "ts": time.time(), "data": data, "error": None}
+        except Exception as e:
+            payload = {"ok": False, "ts": time.time(), "data": None, "error": str(e)}
+
+        with STATE_MUTEX:
+            STATE_CACHE.update(payload)
+        time.sleep(interval_sec)
+
+
+def get_state_pretty() -> str:
+    with STATE_MUTEX:
+        snap = dict(STATE_CACHE)
+    stamp = time.strftime("%H:%M:%S", time.localtime(snap.get("ts", 0)))
+    if snap.get("ok"):
+        return f"Zeit: {stamp}\n\n" + json.dumps(snap["data"], indent=2, ensure_ascii=False)
+    return f"Zeit: {stamp}\n\nERROR: {snap.get('error')}"
+
+
+# =========================
+# Soft-ramp PWM controller
+# =========================
+
+PWM = build_pwm_backend()
+
+PWM_MUTEX = threading.Lock()
+PWM_TARGET = {0: 0.0, 1: 0.0}
+PWM_CURRENT = {0: 0.0, 1: 0.0}
+PWM_LAST_APPLIED = {0: None, 1: None}  # last pulse_us
+
+
+def _slew_step(current: float, target: float, max_delta: float) -> float:
+    if current < target:
+        return min(current + max_delta, target)
+    if current > target:
+        return max(current - max_delta, target)
+    return current
+
+
+def pwm_worker_forever() -> None:
+    tick = 1.0 / RAMP_TICK_HZ
+    while True:
+        time.sleep(tick)
+
+        with PWM_MUTEX:
+            t0, t1 = PWM_TARGET[0], PWM_TARGET[1]
+            c0, c1 = PWM_CURRENT[0], PWM_CURRENT[1]
+
+        # step toward targets
+        n0 = _slew_step(c0, t0, MAX_DELTA_PER_TICK)
+        n1 = _slew_step(c1, t1, MAX_DELTA_PER_TICK)
+
+        # apply pulses only if changed enough (or first time)
+        p0 = throttle_to_pulse_us(n0)
+        p1 = throttle_to_pulse_us(n1)
+
+        # Apply
+        PWM.set_throttle(0, n0)
+        PWM.set_throttle(1, n1)
+
+        with PWM_MUTEX:
+            PWM_CURRENT[0] = n0
+            PWM_CURRENT[1] = n1
+            PWM_LAST_APPLIED[0] = p0
+            PWM_LAST_APPLIED[1] = p1
+
+
+_worker_started = False
+_worker_mutex = threading.Lock()
+
+
+def ensure_pwm_worker() -> None:
+    global _worker_started
+    with _worker_mutex:
+        if _worker_started:
+            return
+        t = threading.Thread(target=pwm_worker_forever, daemon=True)
+        t.start()
+        _worker_started = True
+
+
+def set_targets_from_ui(session_id: str, ch0: float, ch1: float) -> str:
+    ensure_pwm_worker()
+
+    # Always store targets (so UI feels responsive), but only allow control-holder to actually drive.
+    if not can_control(session_id):
+        return "⛔ Du hast kein Control. Werte werden nicht angewendet."
+
+    with PWM_MUTEX:
+        PWM_TARGET[0] = float(max(THROTTLE_MIN, min(THROTTLE_MAX, ch0)))
+        PWM_TARGET[1] = float(max(THROTTLE_MIN, min(THROTTLE_MAX, ch1)))
+
+    with PWM_MUTEX:
+        p0 = throttle_to_pulse_us(PWM_CURRENT[0])
+        p1 = throttle_to_pulse_us(PWM_CURRENT[1])
+        t0 = PWM_TARGET[0]
+        t1 = PWM_TARGET[1]
+
+    return f"✅ Target gesetzt: CH0={t0:.0f}, CH1={t1:.0f} | aktuell: {p0}us / {p1}us"
+
+
+def pwm_stop(session_id: str) -> str:
+    if not can_control(session_id):
+        return "⛔ Du hast kein Control."
+    with PWM_MUTEX:
+        PWM_TARGET[0] = 0.0
+        PWM_TARGET[1] = 0.0
+    return "🛑 Stop: Targets auf 0 gesetzt (soft ramp zurück zur Mitte)."
+
+
+# =========================
+# System actions
+# =========================
+
+def system_action(action: str) -> str:
+    if os.getenv("ENABLE_SYSTEM_ACTIONS", "0") != "1":
+        return "⚠️ System-Aktionen sind deaktiviert. Setze ENABLE_SYSTEM_ACTIONS=1 um zu aktivieren."
+
+    if action == "reboot":
+        cmd = ["sudo", "systemctl", "reboot"]
+    elif action == "shutdown":
+        cmd = ["sudo", "systemctl", "poweroff"]
+    else:
+        return "Unknown action."
+
+    try:
+        subprocess.Popen(cmd)
+        return f"✅ {action} ausgelöst."
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+# =========================
+# Gradio UI (mobile-first)
+# =========================
+
+MOBILE_CSS = """
+/* Center a phone-like container on any screen */
+.rp-phone {
+  max-width: 420px;
+  margin: 0 auto;
+  padding: 10px;
+}
+
+/* Make buttons and sliders more touch-friendly */
+.rp-phone button, .rp-phone input, .rp-phone textarea {
+  font-size: 16px;
+}
+
+/* Responsive video iframe: 16:9 box */
+.rp-video {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 0;
+  border-radius: 14px;
+  overflow: hidden;
+}
+.rp-video iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 14px;
+}
+
+/* Reduce excessive whitespace on desktop */
+.block.svelte-1ed2p3z { padding-top: 8px; }
+"""
+
+def make_session_id() -> str:
+    return str(uuid.uuid4())
+
+
+def build_webrtc_iframe(url: str) -> str:
+    safe_url = (url or "").strip()
+    if not safe_url:
+        return "<div style='padding:12px'>Kein Stream-URL gesetzt.</div>"
+    return f"""
+    <div class="rp-video">
+      <iframe
+        src="{safe_url}"
+        allow="camera; microphone; autoplay; encrypted-media; fullscreen; picture-in-picture"
+      ></iframe>
+    </div>
+    """
+
+
+_poller_started = False
+_poller_mutex = threading.Lock()
+
+
+def ensure_state_poller() -> None:
+    global _poller_started
+    with _poller_mutex:
+        if _poller_started:
+            return
+        t = threading.Thread(target=poll_state_forever, args=(1.0,), daemon=True)
+        t.start()
+        _poller_started = True
+
+
+def app() -> gr.Blocks:
+    with gr.Blocks(title="RudderPi Control", css=MOBILE_CSS, theme=gr.themes.Soft()) as demo:
+        session_id = gr.State(make_session_id)
+
+        with gr.Column(elem_classes=["rp-phone"]):
+            gr.Markdown("## RudderPi – Control UI")
+
+            # Control lock row (mobile-friendly stacked)
+            controller_name = gr.Textbox(label="Controller-Name", value="Browser", max_lines=1)
+            lock_status = gr.Markdown("🔒 Control belegt von: niemand")
+            with gr.Row():
+                btn_take = gr.Button("Control übernehmen", variant="primary")
+                btn_release = gr.Button("Control freigeben")
+
+            hb_timer = gr.Timer(3.0)
+            hb_out = gr.Textbox(visible=False)
+
+            def on_take(sid: str, name: str) -> str:
+                ok, msg = take_control(sid, name)
+                return msg
+
+            def on_release(sid: str) -> str:
+                return release_control(sid)
+
+            def on_hb(sid: str) -> Tuple[str, str]:
+                status = heartbeat(sid)
+                return status, status
+
+            btn_take.click(on_take, inputs=[session_id, controller_name], outputs=[lock_status])
+            btn_release.click(on_release, inputs=[session_id], outputs=[lock_status])
+            demo.load(on_hb, inputs=[session_id], outputs=[lock_status, hb_out])
+            hb_timer.tick(on_hb, inputs=[session_id], outputs=[lock_status, hb_out])
+
+            with gr.Tabs():
+                with gr.Tab("Manual"):
+                    # Stream
+                    stream_url = gr.Textbox(
+                        label="Stream URL (MediaMTX WebRTC UI)",
+                        value="http://localhost:8889/",
+                        max_lines=1,
+                    )
+                    stream_view = gr.HTML(build_webrtc_iframe("http://localhost:8889/"))
+                    stream_url.change(lambda u: build_webrtc_iframe(u), inputs=[stream_url], outputs=[stream_view])
+
+                    # PWM sliders stacked vertically (mobile-first)
+                    gr.Markdown("### Motorregler (ESC)")
+
+                    pwm0 = gr.Slider(
+                        THROTTLE_MIN, THROTTLE_MAX,
+                        value=0, step=1,
+                        label="PWM0 / Motor links (−100 .. +100)"
+                    )
+                    pwm1 = gr.Slider(
+                        THROTTLE_MIN, THROTTLE_MAX,
+                        value=0, step=1,
+                        label="PWM1 / Motor rechts (−100 .. +100)"
+                    )
+
+                    with gr.Row():
+                        btn_stop = gr.Button("🛑 Stop (0)", variant="stop")
+                    pwm_status = gr.Markdown("")
+
+                    # Apply on change
+                    pwm0.change(set_targets_from_ui, inputs=[session_id, pwm0, pwm1], outputs=[pwm_status])
+                    pwm1.change(set_targets_from_ui, inputs=[session_id, pwm0, pwm1], outputs=[pwm_status])
+                    btn_stop.click(pwm_stop, inputs=[session_id], outputs=[pwm_status])
+
+                    # Live state.json
+                    gr.Markdown("### state.json (live)")
+                    state_url = gr.Textbox(label="State URL", value=STATE_URL, max_lines=1)
+                    xauth_pw = gr.Textbox(label="X-Auth Password", value=STATE_XAUTH, type="password", max_lines=1)
+                    state_text = gr.Code(label="state.json", language="json")
+
+                    def on_state_cfg_change(url: str, pw: str) -> str:
+                        global STATE_URL, STATE_XAUTH
+                        with STATE_CFG_MUTEX:
+                            STATE_URL = (url or "").strip()
+                            STATE_XAUTH = pw or ""
+                        ensure_state_poller()
+                        return get_state_pretty()
+
+                    state_url.change(on_state_cfg_change, inputs=[state_url, xauth_pw], outputs=[state_text])
+                    xauth_pw.change(on_state_cfg_change, inputs=[state_url, xauth_pw], outputs=[state_text])
+
+                    state_timer = gr.Timer(1.0)
+
+                    def on_load() -> str:
+                        ensure_state_poller()
+                        ensure_pwm_worker()
+                        return get_state_pretty()
+
+                    demo.load(on_load, outputs=[state_text])
+                    state_timer.tick(lambda: get_state_pretty(), outputs=[state_text])
+
+                with gr.Tab("Auto"):
+                    gr.Markdown("Hier kommt später der Autopilot rein (Heading-Hold, Waypoints, Safety, Logs).")
+
+                with gr.Tab("System"):
+                    gr.Markdown("### System Actions (standardmäßig deaktiviert)")
+                    gr.Markdown("Aktiviere mit `ENABLE_SYSTEM_ACTIONS=1` (und sudo-Rechte am Pi).")
+                    with gr.Row():
+                        btn_reboot = gr.Button("🔄 Reboot")
+                        btn_shutdown = gr.Button("⏻ Shutdown", variant="stop")
+                    sys_out = gr.Markdown()
+                    btn_reboot.click(lambda: system_action("reboot"), outputs=[sys_out])
+                    btn_shutdown.click(lambda: system_action("shutdown"), outputs=[sys_out])
+
+    return demo
+
+
+if __name__ == "__main__":
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "7860"))
+    app().launch(server_name=host, server_port=port)
