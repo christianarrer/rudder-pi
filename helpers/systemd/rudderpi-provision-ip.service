@@ -1,0 +1,8 @@
+[Unit]
+Description=Provision eth0 IP to Android phone (rudder-pi)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/provision-phone-ip.sh

@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry IP provisioning to phone
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=20
+AccuracySec=2
+Unit=rudderpi-provision-ip.service
+
+[Install]
+WantedBy=timers.target

@@ -8,6 +8,9 @@ import android.util.Log;
 import fi.iki.elonen.NanoHTTPD;
 import android.content.SharedPreferences;
 
+import java.util.HashMap;
+import java.util.Map;
+
 public class HttpServer extends NanoHTTPD {
 
     private final TelemetryService telemetryService;
@@ -70,6 +73,72 @@ public class HttpServer extends NanoHTTPD {
             boolean running = telemetryService.isVideoRunning();
             return newFixedLengthResponse(Response.Status.OK, "application/json",
                     "{\"ok\":true,\"running\":" + running + "}");
+        }
+
+        if ("/rudder-pi/ip".equals(session.getUri()) && Method.POST.equals(session.getMethod())) {
+
+            Map<String, String> files = new HashMap<>();
+            try {
+                session.parseBody(files);
+            } catch (Exception e) {
+                return newFixedLengthResponse(
+                        Response.Status.INTERNAL_ERROR,
+                        "application/json",
+                        "{\"ok\":false,\"error\":\"parse_body_failed\"}"
+                );
+            }
+
+            String body = files.get("postData");
+            if (body == null || body.isBlank()) {
+                return newFixedLengthResponse(
+                        Response.Status.BAD_REQUEST,
+                        "application/json",
+                        "{\"ok\":false,\"error\":\"empty_body\"}"
+                );
+            }
+
+            String ip;
+            try {
+                org.json.JSONObject json = new org.json.JSONObject(body);
+                ip = json.optString("ip", null);
+            } catch (Exception e) {
+                return newFixedLengthResponse(
+                        Response.Status.BAD_REQUEST,
+                        "application/json",
+                        "{\"ok\":false,\"error\":\"invalid_json\"}"
+                );
+            }
+
+            if (ip == null || ip.isBlank()) {
+                return newFixedLengthResponse(
+                        Response.Status.BAD_REQUEST,
+                        "application/json",
+                        "{\"ok\":false,\"error\":\"missing_ip\"}"
+                );
+            }
+
+            try {
+                java.net.InetAddress.getByName(ip);
+            } catch (Exception e) {
+                return newFixedLengthResponse(
+                        Response.Status.BAD_REQUEST,
+                        "application/json",
+                        "{\"ok\":false,\"error\":\"invalid_ip\",\"value\":\"" + ip + "\"}"
+                );
+            }
+
+            android.content.SharedPreferences prefs =
+                    telemetryService.getSharedPreferences("app", android.content.Context.MODE_PRIVATE);
+
+            prefs.edit()
+                    .putString("rtsp_remote_server", ip)
+                    .apply();
+
+            return newFixedLengthResponse(
+                    Response.Status.OK,
+                    "application/json",
+                    "{\"ok\":true,\"rtsp_remote_server\":\"" + ip + "\"}"
+            );
         }
 
         return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json",

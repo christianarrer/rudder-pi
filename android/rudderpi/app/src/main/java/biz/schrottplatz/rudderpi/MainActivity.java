@@ -50,6 +50,7 @@ public class MainActivity extends AppCompatActivity {
     private Button btnApplySettings;
     private static final int MAX_LINES = 200;
     private final Deque<String> statusLines = new ArrayDeque<>();
+    private SharedPreferences prefs;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -60,6 +61,14 @@ public class MainActivity extends AppCompatActivity {
             }
         }
     };
+
+    private final SharedPreferences.OnSharedPreferenceChangeListener prefListener =
+            (sharedPreferences, key) -> {
+                if ("rtsp_remote_server".equals(key)) {
+                    final String ip = sharedPreferences.getString("rtsp_remote_server", "");
+                    runOnUiThread(() -> inpRtspRemoteServerIP4.setText(ip));
+                }
+            };
 
     private void addStatusLine(String msg) {
         String ts = new SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -89,18 +98,24 @@ public class MainActivity extends AppCompatActivity {
 
         inpHTTPServerXAuthHeaderPassword = findViewById(R.id.inpHTTPServerXAuthHeaderPassword);
         inpRtspRemoteServerIP4 = findViewById(R.id.inpRtspRemoteServerIP4);
+
+        prefs = getSharedPreferences("app", MODE_PRIVATE);
+
+        // set initial value
+        inpRtspRemoteServerIP4.setText(prefs.getString("rtsp_remote_server", ""));
+
         inpRtspRemoteServerPort = findViewById(R.id.inpRtspRemoteServerPort);
 
         btnApplySettings = findViewById(R.id.btnApplySettings);
 
-        var prefs = getSharedPreferences("app", MODE_PRIVATE);
+        prefs = getSharedPreferences("app", MODE_PRIVATE);
 
         String pw = prefs.getString("http_server_xauth_header_password", "rudderpi");
         if (!pw.isEmpty()) {
             inpHTTPServerXAuthHeaderPassword.setText(pw);
         }
 
-        String ip = prefs.getString("rtsp_remote_server_ipv4", "192.168.0.1");
+        String ip = prefs.getString("rtsp_remote_server", "rudder-pi.local");
         if (!ip.isEmpty()) {
             inpRtspRemoteServerIP4.setText(ip);
         }
@@ -119,7 +134,7 @@ public class MainActivity extends AppCompatActivity {
                 inpHTTPServerXAuthHeaderPassword.setError("Required");
                 ok = false;
             }
-            if (!isValidIPv4(inpIp) || !isValidHostname(inpIp)) {
+            if (!isValidIPv4(inpIp) && !isValidHostname(inpIp)) {
                 inpRtspRemoteServerIP4.setError("Invalid IPv4-Address/Hostname");
                 ok = false;
             } else {
@@ -140,7 +155,7 @@ public class MainActivity extends AppCompatActivity {
             boolean saved = getSharedPreferences("app", MODE_PRIVATE)
                     .edit()
                     .putString("http_server_xauth_header_password", pwStr)
-                    .putString("rtsp_remote_server_ipv4", inpIp)
+                    .putString("rtsp_remote_server", inpIp)
                     .putInt("rtsp_remote_server_port", inpPort)
                     .commit(); // <- synchron, Force-Stop-sicher
 
@@ -163,6 +178,18 @@ public class MainActivity extends AppCompatActivity {
 
         // Beim ersten Start einmal sauber abarbeiten:
         runPermissionFlow();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        prefs.registerOnSharedPreferenceChangeListener(prefListener);
+    }
+
+    @Override
+    protected void onPause() {
+        prefs.unregisterOnSharedPreferenceChangeListener(prefListener);
+        super.onPause();
     }
 
     private void runPermissionFlow() {

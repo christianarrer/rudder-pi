@@ -280,8 +280,12 @@ public class VideoService extends Service {
             loadRtspSettingsFromPrefs();
 
             // 2) Prüfen, ob Settings gültig sind
-            if (!NetUtil.isValidIPv4(rtspRemoteServerIP4) || !isValidHostname(rtspRemoteServerIP4) || !NetUtil.isValidTcpPort(rtspRemoteServerPort)) {
-                postStatus("RTSP: waiting for valid settings...");
+            if ((!NetUtil.isValidIPv4(rtspRemoteServerIP4) && !isValidHostname(rtspRemoteServerIP4)) || !NetUtil.isValidTcpPort(rtspRemoteServerPort)) {
+                postStatus(
+                        "RTSP: waiting for valid settings... "
+                                + rtspRemoteServerIP4 + " "
+                                + rtspRemoteServerPort
+                );
                 sleepQuiet(1000);
                 continue;
             }
@@ -447,12 +451,22 @@ public class VideoService extends Service {
 
     private void loadRtspSettingsFromPrefs() {
         // Beispiel:
-        String ip = getSharedPreferences("app", MODE_PRIVATE)
-                .getString("rtsp_remote_server_ipv4", "rudderpi.local");
-        if (NetUtil.isValidIPv4(ip)) rtspRemoteServerIP4 = ip;
+        String host = getSharedPreferences("app", MODE_PRIVATE)
+                .getString("rtsp_remote_server", "rudder-pi.local");
+
+        if (host != null) host = host.trim();
+        if (host == null || host.isEmpty()) {
+            host = "rudder-pi.local";
+        }
+
+        if (NetUtil.isValidIPv4(host) || NetUtil.isValidHostname(host)) {
+            rtspRemoteServerIP4 = host; // später umbenennen in rtspRemoteServer
+        } else {
+            rtspRemoteServerIP4 = "rudder-pi.local"; // safe fallback
+        }
 
         int port = getSharedPreferences("app", MODE_PRIVATE)
-                 .getInt("rtsp_remote_server_port", 8554);
+                .getInt("rtsp_remote_server_port", 8554);
         if (NetUtil.isValidTcpPort(port)) rtspRemoteServerPort = port;
     }
 

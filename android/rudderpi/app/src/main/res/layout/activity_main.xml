@@ -54,8 +54,8 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
         android:layout_marginTop="12dp"
-        android:inputType="text"
-        android:digits="0123456789." />
+        android:inputType="textUri"
+        android:singleLine="true" />
 
     <EditText
         android:id="@+id/inpRtspRemoteServerPort"
