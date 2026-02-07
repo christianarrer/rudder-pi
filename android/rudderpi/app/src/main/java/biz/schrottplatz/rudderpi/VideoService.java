@@ -101,7 +101,7 @@ public class VideoService extends Service {
         @Override
         public void onConnectionSuccessRtsp() {
             Log.i(TAG, "RTSP: connection success");
-            postStatus("RTSP: connected");
+            postStatus("RTSP: connected to " + rtspRemoteServerIP4);
 
             // streamRunning = true wird in startStreaming gesetzt,
             // aber der Callback zeigt uns: die Verbindung ist wirklich da.
@@ -281,11 +281,7 @@ public class VideoService extends Service {
 
             // 2) Prüfen, ob Settings gültig sind
             if ((!NetUtil.isValidIPv4(rtspRemoteServerIP4) && !isValidHostname(rtspRemoteServerIP4)) || !NetUtil.isValidTcpPort(rtspRemoteServerPort)) {
-                postStatus(
-                        "RTSP: waiting for valid settings... "
-                                + rtspRemoteServerIP4 + " "
-                                + rtspRemoteServerPort
-                );
+                postStatus("RTSP: waiting for valid settings... ");
                 sleepQuiet(1000);
                 continue;
             }

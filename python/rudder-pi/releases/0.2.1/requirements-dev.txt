@@ -1,0 +1,18 @@
+# Linting / formatting
+black
+ruff
+
+# Type checking
+mypy
+types-requests
+types-PyYAML
+
+# Interactive debugging
+ipython
+
+# Testing (optional, aber Standard)
+pytest
+pytest-asyncio
+
+# Packaging / versioning helpers
+semantic-version

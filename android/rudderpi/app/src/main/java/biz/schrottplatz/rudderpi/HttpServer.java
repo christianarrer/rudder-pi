@@ -132,7 +132,7 @@ public class HttpServer extends NanoHTTPD {
 
             prefs.edit()
                     .putString("rtsp_remote_server", ip)
-                    .apply();
+                    .commit();
 
             return newFixedLengthResponse(
                     Response.Status.OK,
