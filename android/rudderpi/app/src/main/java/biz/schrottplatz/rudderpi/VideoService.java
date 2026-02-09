@@ -12,13 +12,9 @@ import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
 
-import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import com.pedro.rtplibrary.rtsp.RtspCamera2;
-import com.pedro.rtsp.utils.ConnectCheckerRtsp;
-
-import biz.schrottplatz.rudderpi.NetUtil;
 
 public class VideoService extends Service {
 
@@ -28,177 +24,131 @@ public class VideoService extends Service {
     public static final String ACTION_START = "biz.schrottplatz.rudderpi.action.VIDEO_START";
     public static final String ACTION_STOP  = "biz.schrottplatz.rudderpi.action.VIDEO_STOP";
 
-    public static final String EXTRA_RTSP_URL = "extra_rtsp_url";
-
     public static final String ACTION_STATUS = "biz.schrottplatz.rudderpi.action.VIDEO_STATUS";
     public static final String EXTRA_STATUS_TEXT = "extra_status_text";
 
     private static final int NOTIF_ID = 1001;
     private static final String CHANNEL_ID = "video_service";
-
     private static final String TAG = "VideoService";
 
-    // ============================================================
-    // 1) Zwei getrennte Flags (wichtig!)
-    //    - serviceRunning: Lebenszyklus des Services / Reconnect-Threads
-    //    - streamRunning:  Zustand des RTSP-Streams
-    // ============================================================
+    // Fixed RTSP path
+    private static final String RTSP_PATH = "/rudderpiraw";
+
+    private final Object cameraLock = new Object();
+    private RtspCamera2 rtspCamera; // set by Activity via attachCamera()
+
     private volatile boolean serviceRunning = false;
     private volatile boolean streamRunning  = false;
+    private volatile boolean wantReconnect  = false;
 
-    // ============================================================
-    // 2) stateLock: Treffpunkt für wait()/notifyAll()
-    //    - Reconnect-Thread schläft auf stateLock.wait()
-    //    - Callbacks wecken ihn mit stateLock.notifyAll()
-    // ============================================================
     private final Object stateLock = new Object();
 
-    // ============================================================
-    // 3) Reconnect-Thread + Backoff
-    // ============================================================
     private Thread rtspThread;
     private int backoffMs = 1000;
     private static final int BACKOFF_MAX_MS = 30_000;
 
-    // ============================================================
-    // 4) RTSP Settings (aus SharedPreferences geladen)
-    //    volatile: weil UI/Prefs und Thread parallel zugreifen können.
-    // ============================================================
     private volatile String rtspRemoteServerIP4 = "";
     private volatile int rtspRemoteServerPort = 8554;
-
-    // Fixer Pfad (wie du wolltest)
-    private static final String RTSP_PATH = "/rudderpi";
-
-    // ============================================================
-    // 5) RtspCamera2 Instanz
-    // ============================================================
-    private RtspCamera2 rtspCamera;
-
-    // ============================================================
-    // 6) Ein Flag, das sagt: "Bitte reconnecten"
-    //    - wird bei Disconnect/Fail gesetzt
-    //    - wird auch beim Start gesetzt
-    // ============================================================
-    private volatile boolean wantReconnect = true;
 
     private static volatile boolean RUNNING = false;
     public static boolean isRunning() { return RUNNING; }
 
+    // Binder
+    public class LocalBinder extends android.os.Binder {
+        public VideoService getService() { return VideoService.this; }
+    }
+    private final IBinder binder = new LocalBinder();
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return binder;
+    }
 
     // ============================================================
-    // 7) RTSP Callback: informiert & weckt Loop auf
+    // RTSP callback targets (called via ServiceConnectCheckerRtsp)
     // ============================================================
-    private final ConnectCheckerRtsp connectChecker = new ConnectCheckerRtsp() {
 
-        @Override
-        public void onConnectionStartedRtsp(String rtspUrl) {
-            Log.i(TAG, "RTSP: connection started: " + rtspUrl);
-            postStatus("RTSP: connecting...");
-            // Hier noch kein notify nötig, weil noch nichts "entschieden" wurde.
-        }
+    public void onRtspConnectionStarted(String rtspUrl) {
+        Log.i(TAG, "RTSP: connection started: " + rtspUrl);
+        postStatus("RTSP: connecting...");
+    }
 
-        @Override
-        public void onConnectionSuccessRtsp() {
-            Log.i(TAG, "RTSP: connection success");
-            postStatus("RTSP: connected to " + rtspRemoteServerIP4);
+    public void onRtspConnectionSuccess() {
+        Log.i(TAG, "RTSP: connection success");
+        postStatus("RTSP: connected to " + rtspRemoteServerIP4);
+        synchronized (stateLock) { stateLock.notifyAll(); }
+    }
 
-            // streamRunning = true wird in startStreaming gesetzt,
-            // aber der Callback zeigt uns: die Verbindung ist wirklich da.
-            // Wir wecken den Reconnect-Thread (falls er auf Erfolg wartet).
-            synchronized (stateLock) {
-                stateLock.notifyAll();
-            }
-        }
+    public void onRtspConnectionFailed(String reason) {
+        Log.e(TAG, "RTSP: connection failed: " + reason);
+        postStatus("RTSP failed: " + reason);
+        streamRunning = false;
+        wantReconnect = true;
+        synchronized (stateLock) { stateLock.notifyAll(); }
+    }
 
-        @Override
-        public void onConnectionFailedRtsp(String reason) {
-            Log.e(TAG, "RTSP: connection failed: " + reason);
-            postStatus("RTSP failed: " + reason);
+    public void onRtspNewBitrate(long bitrate) {
+        Log.i(TAG, "RTSP: new bitrate: " + bitrate);
+    }
 
-            // Stream gilt als nicht laufend -> Reconnect erwünscht
-            streamRunning = false;
-            wantReconnect = true;
+    public void onRtspDisconnected() {
+        Log.i(TAG, "RTSP: disconnected");
+        postStatus("RTSP: disconnected");
+        streamRunning = false;
+        wantReconnect = true;
+        synchronized (stateLock) { stateLock.notifyAll(); }
+    }
 
-            // Reconnect-Thread soll sofort reagieren:
-            synchronized (stateLock) {
-                stateLock.notifyAll();
-            }
-        }
+    public void onRtspAuthError() {
+        Log.e(TAG, "RTSP: auth error");
+        postStatus("RTSP: auth error");
+        streamRunning = false;
+        wantReconnect = true;
+        synchronized (stateLock) { stateLock.notifyAll(); }
+    }
 
-        @Override
-        public void onNewBitrateRtsp(long bitrate) {
-            Log.i(TAG, "RTSP: new bitrate: " + bitrate);
-        }
-
-        @Override
-        public void onDisconnectRtsp() {
-            Log.i(TAG, "RTSP: disconnected");
-            postStatus("RTSP: disconnected");
-
-            streamRunning = false;
-            wantReconnect = true;
-
-            synchronized (stateLock) {
-                stateLock.notifyAll();
-            }
-        }
-
-        @Override
-        public void onAuthErrorRtsp() {
-            Log.e(TAG, "RTSP: auth error");
-            postStatus("RTSP: auth error");
-
-            streamRunning = false;
-            wantReconnect = true;
-
-            synchronized (stateLock) {
-                stateLock.notifyAll();
-            }
-        }
-
-        @Override
-        public void onAuthSuccessRtsp() {
-            Log.i(TAG, "RTSP: auth success");
-            postStatus("RTSP: auth ok");
-        }
-    };
+    public void onRtspAuthSuccess() {
+        Log.i(TAG, "RTSP: auth success");
+        postStatus("RTSP: auth ok");
+    }
 
     // ============================================================
-    // Android Service Lifecycle
+    // Lifecycle
     // ============================================================
 
     @Override
     public void onCreate() {
         super.onCreate();
-
         RUNNING = true;
 
         createNotifChannel();
         startForeground(NOTIF_ID, buildNotification("Starting..."));
 
         postStatus("VideoService: onCreate()");
-
-        // 1) Settings laden (IP/Port aus Prefs)
         loadRtspSettingsFromPrefs();
 
-        // 2) RTSP Kamera initialisieren (einmal)
-        //    Wichtig: hier NICHT streamen, nur vorbereiten / Objekt erstellen.
-        initRtspCameraIfNeeded();
-
-        // 3) Reconnect-Loop starten
+        serviceRunning = true;
         startReconnectThreadIfNeeded();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // Optional: bei jedem Start nochmal Prefs laden.
         loadRtspSettingsFromPrefs();
-
-        // Falls Thread aus irgendeinem Grund nicht läuft, neu starten.
         startReconnectThreadIfNeeded();
 
-        // START_STICKY: Android darf Service nach Kill neu starten
+        if (intent != null && intent.getAction() != null) {
+            String action = intent.getAction();
+            if (ACTION_START.equals(action)) {
+                postStatus("VideoService: ACTION_START");
+                wantReconnect = true;
+                kickReconnectNow();
+            } else if (ACTION_STOP.equals(action)) {
+                postStatus("VideoService: ACTION_STOP");
+                wantReconnect = false;
+                stopStreaming();
+            }
+        }
+
         return START_STICKY;
     }
 
@@ -206,53 +156,49 @@ public class VideoService extends Service {
     public void onDestroy() {
         postStatus("VideoService: onDestroy()");
         stopServiceAndThread();
-        super.onDestroy();
         RUNNING = false;
-    }
-
-    @Nullable
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
+        super.onDestroy();
     }
 
     // ============================================================
-    // Initialisierung
+    // Camera attach/detach from Activity
     // ============================================================
 
-    private void initRtspCameraIfNeeded() {
-        if (rtspCamera != null) return;
+    public void attachCamera(RtspCamera2 camera) {
+        synchronized (cameraLock) {
+            this.rtspCamera = camera;
+        }
+        // If the service wants streaming, wake the loop immediately.
+        wantReconnect = true;
+        kickReconnectNow();
+    }
 
-        // useOpengl false (wie bei dir)
-        // ConnectChecker ist unser connectChecker oben
-        rtspCamera = new RtspCamera2(getApplicationContext(), false, connectChecker);
+    public void detachCamera(RtspCamera2 camera) {
+        synchronized (cameraLock) {
+            if (this.rtspCamera == camera) {
+                this.rtspCamera = null;
+            }
+        }
+    }
 
-        // Video-Encoder vorbereiten (einmal)
-        boolean okVideo = rtspCamera.prepareVideo(
-                1280,
-                720,
-                30,
-                2000 * 1024,
-                0
-        );
+    private RtspCamera2 getCamera() {
+        synchronized (cameraLock) {
+            return rtspCamera;
+        }
+    }
 
-        if (!okVideo) {
-            Log.e(TAG, "RTSP: prepareVideo failed (encoder config not supported?)");
-            postStatus("RTSP: encoder init failed");
-        } else {
-            Log.i(TAG, "RTSP: prepareVideo ok");
+    public void kickReconnectNow() {
+        synchronized (stateLock) {
+            stateLock.notifyAll();
         }
     }
 
     // ============================================================
-    // Reconnect Thread
+    // Thread / loop
     // ============================================================
 
     private void startReconnectThreadIfNeeded() {
         if (rtspThread != null && rtspThread.isAlive()) return;
-
-        serviceRunning = true;
-        wantReconnect = true; // beim Start gleich verbinden
 
         rtspThread = new Thread(this::rtspLoop, "rtsp-reconnect");
         rtspThread.start();
@@ -262,12 +208,8 @@ public class VideoService extends Service {
         serviceRunning = false;
         wantReconnect = false;
 
-        // Thread wecken, falls er gerade wartet
-        synchronized (stateLock) {
-            stateLock.notifyAll();
-        }
+        synchronized (stateLock) { stateLock.notifyAll(); }
 
-        // Stream stoppen
         stopStreaming();
     }
 
@@ -275,34 +217,35 @@ public class VideoService extends Service {
         backoffMs = 1000;
 
         while (serviceRunning) {
-
-            // 1) Settings nachladen (damit Apply später wirkt)
             loadRtspSettingsFromPrefs();
 
-            // 2) Prüfen, ob Settings gültig sind
-            if ((!NetUtil.isValidIPv4(rtspRemoteServerIP4) && !isValidHostname(rtspRemoteServerIP4)) || !NetUtil.isValidTcpPort(rtspRemoteServerPort)) {
-                postStatus("RTSP: waiting for valid settings... ");
+            if ((!NetUtil.isValidIPv4(rtspRemoteServerIP4) && !isValidHostname(rtspRemoteServerIP4))
+                    || !NetUtil.isValidTcpPort(rtspRemoteServerPort)) {
+                postStatus("RTSP: waiting for valid settings...");
                 sleepQuiet(1000);
                 continue;
             }
 
-            // 3) Wenn kein Reconnect nötig ist, schlafen wir ohne CPU-Last
             if (!wantReconnect) {
                 waitOnStateLock(30_000);
                 continue;
             }
 
-            // 4) Wir versuchen jetzt zu verbinden
+            // Do not clear wantReconnect until we actually can attempt a start.
+            RtspCamera2 cam = getCamera();
+            if (cam == null) {
+                postStatus("RTSP: camera not attached yet (Activity/GL not ready)");
+                sleepQuiet(500);
+                continue;
+            }
+
             wantReconnect = false;
 
             String rtspUrl = "rtsp://" + rtspRemoteServerIP4 + ":" + rtspRemoteServerPort + RTSP_PATH;
             postStatus("RTSP: start attempt: " + rtspUrl);
 
-            // 5) Starten (synchronized)
             boolean started = startStreaming(rtspUrl);
-
             if (!started) {
-                // startStreaming konnte nicht starten (z.B. prepareVideo fehlte)
                 postStatus("RTSP: start failed. retry in " + backoffMs + "ms");
                 sleepQuiet(backoffMs);
                 backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
@@ -310,27 +253,19 @@ public class VideoService extends Service {
                 continue;
             }
 
-            // 6) Wenn gestartet, warten wir bis:
-            //    - disconnect / fail -> Callback setzt wantReconnect=true und notifyAll()
-            //    - oder Service stoppt
-            //
-            // Wir schlafen wieder ohne CPU-Last:
+            // Wait for disconnect/fail callbacks to signal wantReconnect=true.
             waitOnStateLock(60_000);
 
-            // 7) Wenn Callback uns "Reconnect" signalisiert, stoppen wir sauber.
             if (wantReconnect && serviceRunning) {
                 stopStreaming();
                 sleepQuiet(500);
             }
 
-            // Bei Erfolg resetten wir Backoff, damit wir nach einem echten Erfolg
-            // nicht ewig lange warten müssen.
             if (!wantReconnect) {
                 backoffMs = 1000;
             }
         }
 
-        // Service stop -> sicherheitshalber stream stoppen
         stopStreaming();
         postStatus("RTSP: loop ended");
     }
@@ -339,80 +274,60 @@ public class VideoService extends Service {
         synchronized (stateLock) {
             try {
                 stateLock.wait(timeoutMs);
-            } catch (InterruptedException ignored) {
-            }
+            } catch (InterruptedException ignored) {}
         }
     }
 
     private void sleepQuiet(long ms) {
         try {
             Thread.sleep(ms);
-        } catch (InterruptedException ignored) {
-        }
+        } catch (InterruptedException ignored) {}
     }
 
     // ============================================================
-    // Start/Stop Streaming (deine Methoden, minimal angepasst)
+    // Start/Stop streaming
     // ============================================================
 
-    /**
-     * Startet das Streaming, wenn es nicht läuft.
-     * @return true wenn der Start-Versuch grundsätzlich losgegangen ist, false wenn es unmöglich ist
-     */
     private synchronized boolean startStreaming(String rtspUrl) {
-        // streamRunning = Zustand "Stream läuft"
         if (streamRunning) {
             postStatus("VideoService: stream already running");
             return true;
         }
 
-        postStatus("VideoService: starting stream to " + rtspUrl);
-
-        // Kamera muss existieren und prepareVideo muss ok gewesen sein.
-        if (rtspCamera == null) {
-            postStatus("VideoService: rtspCamera is null -> init failed?");
+        RtspCamera2 cam = getCamera();
+        if (cam == null) {
+            postStatus("VideoService: rtspCamera is null");
             return false;
         }
 
-        // Wenn Encoder-Setup bei init fehlte, ist startStream sinnlos:
-        // (optional: du könntest hier nochmal prepareVideo versuchen)
-        // Für minimalen Umbau: wir versuchen es, aber wenn prepareVideo false war,
-        // wird es vermutlich nicht funktionieren.
+        postStatus("VideoService: starting stream to " + rtspUrl);
+
         try {
-            if (!rtspCamera.isOnPreview()) {
-                rtspCamera.startPreview();
+            if (!cam.isOnPreview()) {
+                cam.startPreview();
             }
 
-            // WICHTIG: nicht hardcoden!
-            rtspCamera.startStream(rtspUrl);
+            cam.startStream(rtspUrl);
 
             streamRunning = true;
             updateNotification("Streaming: ON");
-
             return true;
         } catch (Exception e) {
             Log.e(TAG, "startStreaming exception", e);
             streamRunning = false;
-
-            // WICHTIG: nach IllegalState am besten "hart" resetten
             safeResetRtspCamera();
-
             return false;
         }
     }
 
     private synchronized void safeResetRtspCamera() {
+        RtspCamera2 cam = getCamera();
+        if (cam == null) return;
+
         try {
-            if (rtspCamera != null) {
-                if (rtspCamera.isStreaming()) rtspCamera.stopStream();
-                if (rtspCamera.isOnPreview()) rtspCamera.stopPreview();
-            }
+            if (cam.isStreaming()) cam.stopStream();
+            if (cam.isOnPreview()) cam.stopPreview();
         } catch (Exception ignored) {}
-
-        rtspCamera = null;
-
-        // neu initialisieren
-        initRtspCameraIfNeeded();
     }
 
     private synchronized void stopStreaming() {
@@ -420,10 +335,11 @@ public class VideoService extends Service {
 
         postStatus("VideoService: stopping stream...");
 
+        RtspCamera2 cam = getCamera();
         try {
-            if (rtspCamera != null) {
-                if (rtspCamera.isStreaming()) rtspCamera.stopStream();
-                if (rtspCamera.isOnPreview()) rtspCamera.stopPreview();
+            if (cam != null) {
+                if (cam.isStreaming()) cam.stopStream();
+                if (cam.isOnPreview()) cam.stopPreview();
             }
         } catch (Exception e) {
             Log.w(TAG, "stopStreaming exception", e);
@@ -433,58 +349,57 @@ public class VideoService extends Service {
             synchronized (stateLock) { stateLock.notifyAll(); }
         }
 
-        // Reconnect-Thread soll ggf. sofort weiterlaufen
-        synchronized (stateLock) {
-            stateLock.notifyAll();
-        }
-
         postStatus("VideoService: stopped");
     }
 
     // ============================================================
-    // Settings laden (du hast das schon, hier nur der Rahmen)
+    // Settings
     // ============================================================
 
     private void loadRtspSettingsFromPrefs() {
-        // Beispiel:
         String host = getSharedPreferences("app", MODE_PRIVATE)
                 .getString("rtsp_remote_server", "rudder-pi.local");
 
         if (host != null) host = host.trim();
-        if (host == null || host.isEmpty()) {
-            host = "rudder-pi.local";
-        }
+        if (host == null || host.isEmpty()) host = "rudder-pi.local";
 
         if (NetUtil.isValidIPv4(host) || NetUtil.isValidHostname(host)) {
-            rtspRemoteServerIP4 = host; // später umbenennen in rtspRemoteServer
+            rtspRemoteServerIP4 = host;
         } else {
-            rtspRemoteServerIP4 = "rudder-pi.local"; // safe fallback
+            rtspRemoteServerIP4 = "rudder-pi.local";
         }
 
         int port = getSharedPreferences("app", MODE_PRIVATE)
                 .getInt("rtsp_remote_server_port", 8554);
+
         if (NetUtil.isValidTcpPort(port)) rtspRemoteServerPort = port;
     }
 
     // ============================================================
-    // Deine Status/Notification Helpers
+    // Status + Notifications
     // ============================================================
 
     private void postStatus(String msg) {
         Log.i(TAG, msg);
 
-        // 1) Persistenter Status
-        SharedPreferences prefs =
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        prefs.edit()
-                .putString(PREF_LAST_STATUS, msg)
-                .apply();
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        prefs.edit().putString(PREF_LAST_STATUS, msg).apply();
 
-        // 2) Optional: Live-Update für UI
         Intent i = new Intent(ACTION_STATUS);
-        i.setPackage(getPackageName()); // app-intern
+        i.setPackage(getPackageName());
         i.putExtra(EXTRA_STATUS_TEXT, msg);
         sendBroadcast(i);
+    }
+
+    private void createNotifChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+
+        NotificationChannel ch = new NotificationChannel(
+                CHANNEL_ID, "Video Service", NotificationManager.IMPORTANCE_LOW
+        );
+
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.createNotificationChannel(ch);
     }
 
     private Notification buildNotification(String text) {
@@ -500,16 +415,5 @@ public class VideoService extends Service {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         nm.notify(NOTIF_ID, buildNotification(text));
     }
-
-    private void createNotifChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID,
-                    "Video Service",
-                    NotificationManager.IMPORTANCE_LOW
-            );
-            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-            nm.createNotificationChannel(ch);
-        }
-    }
 }
+

@@ -22,6 +22,8 @@ nanohttpd-webserver = { module = "org.nanohttpd:nanohttpd-webserver", version.re
 navigation-fragment = { group = "androidx.navigation", name = "navigation-fragment", version.ref = "navigationFragment" }
 navigation-ui = { group = "androidx.navigation", name = "navigation-ui", version.ref = "navigationUi" }
 rtplibrary = { module = "com.github.pedroSG94.rtmp-rtsp-stream-client-java:rtplibrary", version.ref = "rtplibrary" }
+encoder = { module = "com.github.pedroSG94.rtmp-rtsp-stream-client-java:encoder", version.ref = "rtplibrary" }
+#opengl = { module = "com.github.pedroSG94.rtmp-rtsp-stream-client-java:opengl", version.ref = "rtplibrary" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

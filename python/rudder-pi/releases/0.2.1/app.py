@@ -53,7 +53,7 @@ MAX_DELTA_PER_TICK = 3.0
 
 # Neutral hold when switching forward <-> reverse (gas sign flip).
 # 0.25..0.6s is usually a good range for car ESCs.
-NEUTRAL_HOLD_SEC = 0.35
+NEUTRAL_HOLD_SEC = 1.0
 
 # Ignore tiny jitter around zero so we don't trigger a hold accidentally.
 GAS_DEADBAND = 3.0  # throttle units (-100..+100)
@@ -103,7 +103,10 @@ def guess_state_url(dev: str = "eth0") -> str | None:
 STATE_URL = os.getenv("STATE_URL", "").strip()
 if not STATE_URL:
     guessed = guess_state_url("eth0")
-    STATE_URL = guessed or "http://192.168.42.129/state.json"  # fallback
+    if guessed:
+        STATE_URL = guessed
+    else:
+        STATE_URL = "http://192.168.42.129/state.json" # fallback
 
 
 
@@ -383,7 +386,6 @@ STATE_CACHE: Dict[str, Any] = {"ok": False, "ts": 0.0, "data": None, "error": "n
 STATE_MUTEX = threading.Lock()
 
 STATE_CFG_MUTEX = threading.Lock()
-STATE_URL = "http://192.168.42.129/state.json"
 STATE_XAUTH = "rudderpi"
 
 def poll_state_forever(interval_sec: float = 1.0) -> None:

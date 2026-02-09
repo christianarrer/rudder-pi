@@ -105,5 +105,10 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+  <com.pedro.rtplibrary.view.OpenGlView
+      android:id="@+id/glView"
+      android:layout_width="1dp"
+      android:layout_height="1dp" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>
 

@@ -44,6 +44,8 @@ dependencies {
     //implementation("com.github.pedroSG94.RootEncoder:extra-sources:2.6.7")
     //implementation("com.github.pedroSG94.rtmp-rtsp-stream-client-java:rtplibrary:2.2.2")
     implementation(libs.rtplibrary)
+    implementation(libs.encoder)
+    //implementation(libs.opengl)
     implementation(libs.nanohttpd.webserver)
     implementation(libs.appcompat)
     implementation(libs.material)

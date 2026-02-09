@@ -4,12 +4,13 @@ import static biz.schrottplatz.rudderpi.NetUtil.isValidIPv4;
 import static biz.schrottplatz.rudderpi.NetUtil.isValidTcpPort;
 import static biz.schrottplatz.rudderpi.NetUtil.isValidHostname;
 
-
 import android.Manifest;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
@@ -19,17 +20,14 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 
-import android.text.InputFilter;
-import android.text.Layout;
+import android.os.IBinder;
 import android.text.method.ScrollingMovementMethod;
 import android.util.Log;
-import android.view.View;
 
 import androidx.core.content.ContextCompat;
 
-import android.widget.Button;
-import android.widget.TextView;
-import android.widget.EditText;
+import com.pedro.rtplibrary.rtsp.RtspCamera2;
+import com.pedro.rtsp.utils.ConnectCheckerRtsp;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
@@ -37,20 +35,25 @@ import java.util.Date;
 import java.util.Deque;
 import java.util.Locale;
 
+import biz.schrottplatz.rudderpi.databinding.ActivityMainBinding;
 
 public class MainActivity extends AppCompatActivity {
+
+    private static final int MAX_LINES = 200;
+
+    private ActivityMainBinding binding;
+    private SharedPreferences prefs;
 
     private ActivityResultLauncher<String> permLauncher;
     private final ArrayDeque<String> permQueue = new ArrayDeque<>();
     private boolean permFlowRunning = false;
-    private TextView tvStatus;
-    private EditText inpHTTPServerXAuthHeaderPassword;
-    private EditText inpRtspRemoteServerIP4;
-    private EditText inpRtspRemoteServerPort;
-    private Button btnApplySettings;
-    private static final int MAX_LINES = 200;
+
     private final Deque<String> statusLines = new ArrayDeque<>();
-    private SharedPreferences prefs;
+
+    private VideoService videoService;
+    private boolean serviceBound = false;
+
+    private RtspCamera2 rtspCamera;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -66,86 +69,90 @@ public class MainActivity extends AppCompatActivity {
             (sharedPreferences, key) -> {
                 if ("rtsp_remote_server".equals(key)) {
                     final String ip = sharedPreferences.getString("rtsp_remote_server", "");
-                    runOnUiThread(() -> inpRtspRemoteServerIP4.setText(ip));
+                    runOnUiThread(() -> binding.inpRtspRemoteServerIP4.setText(ip));
                 }
             };
 
-    private void addStatusLine(String msg) {
-        String ts = new SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-                .format(new Date());
+    private final ServiceConnection conn = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            videoService = ((VideoService.LocalBinder) service).getService();
+            serviceBound = true;
 
-        statusLines.addFirst("[" + ts + "] " + msg);
+            // Create checker that forwards to the service
+            ConnectCheckerRtsp checker = new ServiceConnectCheckerRtsp(videoService);
 
-        while (statusLines.size() > MAX_LINES) {
-            statusLines.removeLast();
+            // GL camera created in Activity (must have a real View)
+            rtspCamera = new RtspCamera2(binding.glView, checker);
+
+            boolean okVideo = rtspCamera.prepareVideo(720, 1280, 30, 1500 * 1024, 90);
+            if (!okVideo) {
+                Log.e("MainActivity", "prepareVideo failed");
+                addStatusLine("RTSP: encoder init failed");
+                return;
+            }
+
+            // Real pixel rotation via GL
+            rtspCamera.getGlInterface().setRotation(90);
+
+            // Hand camera to service for reconnect/start/stop logic
+            videoService.attachCamera(rtspCamera);
         }
 
-        StringBuilder sb = new StringBuilder();
-        for (String line : statusLines) {
-            sb.append(line).append('\n');
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            serviceBound = false;
+            videoService = null;
         }
-
-        tvStatus.setText(sb.toString());
-    }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        tvStatus = findViewById(R.id.tvStatus);
-        tvStatus.setMovementMethod(new ScrollingMovementMethod());
 
-        inpHTTPServerXAuthHeaderPassword = findViewById(R.id.inpHTTPServerXAuthHeaderPassword);
-        inpRtspRemoteServerIP4 = findViewById(R.id.inpRtspRemoteServerIP4);
+        binding = ActivityMainBinding.inflate(getLayoutInflater());
+        setContentView(binding.getRoot());
 
-        prefs = getSharedPreferences("app", MODE_PRIVATE);
-
-        // set initial value
-        inpRtspRemoteServerIP4.setText(prefs.getString("rtsp_remote_server", ""));
-
-        inpRtspRemoteServerPort = findViewById(R.id.inpRtspRemoteServerPort);
-
-        btnApplySettings = findViewById(R.id.btnApplySettings);
+        binding.tvStatus.setMovementMethod(new ScrollingMovementMethod());
 
         prefs = getSharedPreferences("app", MODE_PRIVATE);
 
+        // Restore UI fields
         String pw = prefs.getString("http_server_xauth_header_password", "rudderpi");
-        if (!pw.isEmpty()) {
-            inpHTTPServerXAuthHeaderPassword.setText(pw);
-        }
+        if (pw != null && !pw.isEmpty()) binding.inpHTTPServerXAuthHeaderPassword.setText(pw);
 
-        String ip = prefs.getString("rtsp_remote_server", "rudder-pi.local");
-        if (!ip.isEmpty()) {
-            inpRtspRemoteServerIP4.setText(ip);
-        }
+        String host = prefs.getString("rtsp_remote_server", "rudder-pi.local");
+        if (host != null && !host.isEmpty()) binding.inpRtspRemoteServerIP4.setText(host);
 
         int port = prefs.getInt("rtsp_remote_server_port", 8554);
-        inpRtspRemoteServerPort.setText(String.valueOf(port));
+        binding.inpRtspRemoteServerPort.setText(String.valueOf(port));
 
-        btnApplySettings.setOnClickListener(v -> {
-            String pwStr = inpHTTPServerXAuthHeaderPassword.getText().toString().trim();
-            String inpIp = inpRtspRemoteServerIP4.getText().toString().trim();
-            String portStr = inpRtspRemoteServerPort.getText().toString().trim();
+        binding.btnApplySettings.setOnClickListener(v -> {
+            String pwStr = binding.inpHTTPServerXAuthHeaderPassword.getText().toString().trim();
+            String inpHost = binding.inpRtspRemoteServerIP4.getText().toString().trim();
+            String portStr = binding.inpRtspRemoteServerPort.getText().toString().trim();
 
             boolean ok = true;
 
             if (pwStr.isEmpty()) {
-                inpHTTPServerXAuthHeaderPassword.setError("Required");
+                binding.inpHTTPServerXAuthHeaderPassword.setError("Required");
                 ok = false;
             }
-            if (!isValidIPv4(inpIp) && !isValidHostname(inpIp)) {
-                inpRtspRemoteServerIP4.setError("Invalid IPv4-Address/Hostname");
+
+            if (!isValidIPv4(inpHost) && !isValidHostname(inpHost)) {
+                binding.inpRtspRemoteServerIP4.setError("Invalid IPv4-Address/Hostname");
                 ok = false;
             } else {
-                inpRtspRemoteServerIP4.setError(null);
+                binding.inpRtspRemoteServerIP4.setError(null);
             }
 
             if (!isValidTcpPort(portStr)) {
-                inpRtspRemoteServerPort.setError("Invalid TCP/UDP-Port (1–65535)");
+                binding.inpRtspRemoteServerPort.setError("Invalid TCP/UDP-Port (1–65535)");
                 ok = false;
             } else {
-                inpRtspRemoteServerPort.setError(null);
+                binding.inpRtspRemoteServerPort.setError(null);
             }
 
             if (!ok) return;
@@ -155,12 +162,18 @@ public class MainActivity extends AppCompatActivity {
             boolean saved = getSharedPreferences("app", MODE_PRIVATE)
                     .edit()
                     .putString("http_server_xauth_header_password", pwStr)
-                    .putString("rtsp_remote_server", inpIp)
+                    .putString("rtsp_remote_server", inpHost)
                     .putInt("rtsp_remote_server_port", inpPort)
-                    .commit(); // <- synchron, Force-Stop-sicher
+                    .commit();
 
             if (!saved) {
                 Log.e("UI", "cannot save settings");
+            } else {
+                addStatusLine("Settings saved");
+                // Wake reconnect thread if service is bound
+                if (serviceBound && videoService != null) {
+                    videoService.kickReconnectNow();
+                }
             }
         });
 
@@ -169,14 +182,9 @@ public class MainActivity extends AppCompatActivity {
 
         permLauncher = registerForActivityResult(
                 new ActivityResultContracts.RequestPermission(),
-                granted -> {
-                    // Optional: wenn abgelehnt -> Hinweis anzeigen, aber trotzdem fortsetzen,
-                    // sonst hängt man fest.
-                    requestNextPermissionOrStart();
-                }
+                granted -> requestNextPermissionOrStart()
         );
 
-        // Beim ersten Start einmal sauber abarbeiten:
         runPermissionFlow();
     }
 
@@ -192,14 +200,43 @@ public class MainActivity extends AppCompatActivity {
         super.onPause();
     }
 
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+
+        try {
+            unregisterReceiver(statusReceiver);
+        } catch (IllegalArgumentException ignored) {}
+
+        if (serviceBound) {
+            try {
+                if (videoService != null && rtspCamera != null) {
+                    videoService.detachCamera(rtspCamera);
+                }
+                unbindService(conn);
+            } catch (Exception ignored) {}
+            serviceBound = false;
+        }
+    }
+
+    private void addStatusLine(String msg) {
+        String ts = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
+        statusLines.addFirst("[" + ts + "] " + msg);
+
+        while (statusLines.size() > MAX_LINES) statusLines.removeLast();
+
+        StringBuilder sb = new StringBuilder();
+        for (String line : statusLines) sb.append(line).append('\n');
+
+        binding.tvStatus.setText(sb.toString());
+    }
+
     private void runPermissionFlow() {
         if (permFlowRunning) return;
         permFlowRunning = true;
 
         permQueue.clear();
 
-        // Reihenfolge festlegen:
-        // 1) Notifications (Android 13+)
         if (Build.VERSION.SDK_INT >= 33) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                     != PackageManager.PERMISSION_GRANTED) {
@@ -207,13 +244,11 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        // 2) Location
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
                 != PackageManager.PERMISSION_GRANTED) {
             permQueue.add(Manifest.permission.ACCESS_FINE_LOCATION);
         }
 
-        // 3) Camera
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
             permQueue.add(Manifest.permission.CAMERA);
@@ -223,16 +258,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void requestNextPermissionOrStart() {
-        // nächste fehlende Permission suchen (Queue kann inzwischen veraltet sein)
         while (!permQueue.isEmpty()) {
             String p = permQueue.removeFirst();
             if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
                 permLauncher.launch(p);
-                return; // wichtig: immer nur EIN Dialog gleichzeitig
+                return;
             }
         }
 
-        // Fertig: alle abgearbeitet
         permFlowRunning = false;
         maybeStartServices();
     }
@@ -247,9 +280,14 @@ public class MainActivity extends AppCompatActivity {
                         == PackageManager.PERMISSION_GRANTED;
 
         if (hasLocation) startTelemetryService();
-        if (hasCamera) startVideoService();
-    }
 
+        if (hasCamera) {
+            startVideoService();
+
+            // Bind so we can attach the GL camera instance to the service.
+            bindService(new Intent(this, VideoService.class), conn, BIND_AUTO_CREATE);
+        }
+    }
 
     private void startTelemetryService() {
         Intent i = new Intent(this, TelemetryService.class);
@@ -262,15 +300,10 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void stopTelemetryService() {
-        Intent i = new Intent(this, TelemetryService.class);
-        i.setAction(TelemetryService.ACTION_STOP);
-        startService(i);
-    }
-
     private void startVideoService() {
         Intent i = new Intent(this, VideoService.class);
         i.setAction(VideoService.ACTION_START);
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(i);
         } else {
@@ -278,15 +311,9 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void stopVideoService() {
-        Intent i = new Intent(this, VideoService.class);
-        i.setAction(VideoService.ACTION_STOP);
-        startService(i);
-    }
-
     private void registerStatusReceiver() {
         IntentFilter f = new IntentFilter(VideoService.ACTION_STATUS);
-        if (android.os.Build.VERSION.SDK_INT >= 33) { // Android 13+
+        if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(statusReceiver, f, Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(statusReceiver, f);
@@ -294,21 +321,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void restoreLastStatus() {
-        SharedPreferences prefs =
-                getSharedPreferences(VideoService.PREFS_NAME, MODE_PRIVATE);
-
-        String lastStatus = prefs.getString(
-                VideoService.PREF_LAST_STATUS,
-                "waiting for status..."
-        );
-
-        tvStatus.setText(lastStatus);
-    }
-
-    protected void onDestroy() {
-        super.onDestroy();
-        try {
-            unregisterReceiver(statusReceiver);
-        } catch (IllegalArgumentException ignored) {}
+        SharedPreferences p = getSharedPreferences(VideoService.PREFS_NAME, MODE_PRIVATE);
+        String lastStatus = p.getString(VideoService.PREF_LAST_STATUS, "waiting for status...");
+        binding.tvStatus.setText(lastStatus);
     }
 }
