@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ping-lan.service every 20 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=20
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

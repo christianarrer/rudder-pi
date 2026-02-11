@@ -1,0 +1,33 @@
+[Unit]
+Description=Rudder Pi Service
+Wants=network-online.target
+After=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/rudder-pi
+
+# Optional: don't fail if env file is missing (leading "-")
+EnvironmentFile=-/etc/rudder-pi/env
+
+# Ensure immediate logs in journalctl and predictable behavior
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/rudder-pi/.venv/bin/python -u /opt/rudder-pi/app.py
+
+Restart=on-failure
+RestartSec=2
+
+# Optional hardening (safe defaults; remove if it causes issues)
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# If you need to bind to privileged ports (<1024), you'd need more settings.
+# For 7860/8080 etc. this is fine.
+
+[Install]
+WantedBy=multi-user.target

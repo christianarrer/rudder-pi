@@ -1,0 +1,6 @@
+[Unit]
+Description=Keep LAN connection alive by pinging 192.168.21.80
+
+[Service]
+Type=oneshot
+ExecStart=/bin/ping -c 1 -W 1 192.168.21.80

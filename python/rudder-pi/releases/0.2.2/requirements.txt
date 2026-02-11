@@ -1,0 +1,26 @@
+# Web / API
+fastapi
+uvicorn[standard]
+requests
+aiofiles
+python-multipart
+orjson
+PyYAML
+
+# UI / CLI
+gradio
+gradio_client
+rich
+typer
+
+# Media
+pillow
+pydub
+ffmpy
+
+# Data / math
+numpy
+pandas
+
+# GPIO / hardware
+pigpio
