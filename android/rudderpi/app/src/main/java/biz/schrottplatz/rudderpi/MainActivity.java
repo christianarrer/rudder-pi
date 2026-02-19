@@ -23,10 +23,13 @@ import androidx.appcompat.app.AppCompatActivity;
 import android.os.IBinder;
 import android.text.method.ScrollingMovementMethod;
 import android.util.Log;
+import android.view.SurfaceHolder;
+import android.widget.Button;
 
 import androidx.core.content.ContextCompat;
 
 import com.pedro.rtplibrary.rtsp.RtspCamera2;
+import com.pedro.rtplibrary.view.OpenGlView;
 import com.pedro.rtsp.utils.ConnectCheckerRtsp;
 
 import java.text.SimpleDateFormat;
@@ -54,6 +57,8 @@ public class MainActivity extends AppCompatActivity {
     private boolean serviceBound = false;
 
     private RtspCamera2 rtspCamera;
+    private ConnectCheckerRtsp connectChecker;
+    private volatile boolean glSurfaceReady = false;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -80,29 +85,17 @@ public class MainActivity extends AppCompatActivity {
             serviceBound = true;
 
             // Create checker that forwards to the service
-            ConnectCheckerRtsp checker = new ServiceConnectCheckerRtsp(videoService);
+            connectChecker = new ServiceConnectCheckerRtsp(videoService);
 
-            // GL camera created in Activity (must have a real View)
-            rtspCamera = new RtspCamera2(binding.glView, checker);
-
-            boolean okVideo = rtspCamera.prepareVideo(720, 1280, 30, 1500 * 1024, 90);
-            if (!okVideo) {
-                Log.e("MainActivity", "prepareVideo failed");
-                addStatusLine("RTSP: encoder init failed");
-                return;
-            }
-
-            // Real pixel rotation via GL
-            rtspCamera.getGlInterface().setRotation(90);
-
-            // Hand camera to service for reconnect/start/stop logic
-            videoService.attachCamera(rtspCamera);
+            // Only create/attach camera when the Surface is actually valid.
+            maybeCreateAndAttachCamera();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
             serviceBound = false;
             videoService = null;
+            connectChecker = null;
         }
     };
 
@@ -111,9 +104,42 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-
         binding = ActivityMainBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+
+        // IMPORTANT: OpenGlView must have a valid Surface before RtspCamera2/GL thread can start.
+        binding.glView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                Log.i("rudderpi", "surfaceCreated: valid=" + holder.getSurface().isValid()
+                        + " viewShown=" + binding.glView.isShown()
+                        + " vis=" + binding.glView.getVisibility()
+                        + " w=" + binding.glView.getWidth() + " h=" + binding.glView.getHeight());
+                glSurfaceReady = holder.getSurface() != null && holder.getSurface().isValid();
+                Log.i("MainActivity", "GL surfaceCreated valid=" + glSurfaceReady);
+
+                // Notify service (it will gate reconnect attempts until ready).
+                sendVideoServiceAction(VideoService.ACTION_GL_SURFACE_READY);
+
+                // If service is already bound, create/attach camera now.
+                maybeCreateAndAttachCamera();
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                glSurfaceReady = false;
+                Log.i("MainActivity", "GL surfaceDestroyed");
+
+                // Tell service to stop streaming and forget GL.
+                sendVideoServiceAction(VideoService.ACTION_GL_SURFACE_GONE);
+
+                // Detach and drop camera instance (GL context is gone).
+                detachAndDropCamera();
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) { }
+        });
 
         binding.tvStatus.setMovementMethod(new ScrollingMovementMethod());
 
@@ -177,6 +203,21 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        Button btnAdmin = findViewById(R.id.btnAdmin);
+        btnAdmin.setOnClickListener(v -> {
+            // Open tethering settings (may fall back depending on OEM/Android version)
+            Intent i = new Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                startActivity(i);
+            } catch (Exception e) {
+                // Fallback: open general settings
+                Intent fallback = new Intent(android.provider.Settings.ACTION_SETTINGS);
+                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(fallback);
+            }
+        });
+
         restoreLastStatus();
         registerStatusReceiver();
 
@@ -208,11 +249,10 @@ public class MainActivity extends AppCompatActivity {
             unregisterReceiver(statusReceiver);
         } catch (IllegalArgumentException ignored) {}
 
+        detachAndDropCamera();
+
         if (serviceBound) {
             try {
-                if (videoService != null && rtspCamera != null) {
-                    videoService.detachCamera(rtspCamera);
-                }
                 unbindService(conn);
             } catch (Exception ignored) {}
             serviceBound = false;
@@ -308,6 +348,59 @@ public class MainActivity extends AppCompatActivity {
             startForegroundService(i);
         } else {
             startService(i);
+        }
+    }
+
+    private void sendVideoServiceAction(String action) {
+        Log.i("rudderpi", "sendVideoServiceAction action: " + VideoService.ACTION_GL_SURFACE_READY);
+        try {
+            Intent i = new Intent(this, VideoService.class);
+            i.setAction(action);
+            // Service should already be running; startService is fine for control actions.
+            startService(i);
+        } catch (Exception e) {
+            Log.w("MainActivity", "sendVideoServiceAction failed: " + action, e);
+        }
+    }
+
+    private void maybeCreateAndAttachCamera() {
+        if (!serviceBound || videoService == null) return;
+        if (!glSurfaceReady) return;
+        if (rtspCamera != null) return;
+        if (connectChecker == null) return;
+
+        try {
+            // Create a fresh RtspCamera2 bound to the current Surface.
+            rtspCamera = new RtspCamera2(binding.glView, connectChecker);
+
+            boolean okVideo = rtspCamera.prepareVideo(720, 1280, 30, 1500 * 1024, 90);
+            if (!okVideo) {
+                Log.e("MainActivity", "prepareVideo failed");
+                addStatusLine("RTSP: encoder init failed");
+                rtspCamera = null;
+                return;
+            }
+
+            // Real pixel rotation via GL
+            rtspCamera.getGlInterface().setRotation(90);
+
+            // Hand camera to service for reconnect/start/stop logic
+            videoService.attachCamera(rtspCamera);
+        } catch (Exception e) {
+            Log.e("MainActivity", "maybeCreateAndAttachCamera failed", e);
+            addStatusLine("RTSP: camera attach failed: " + e.getMessage());
+            rtspCamera = null;
+        }
+    }
+
+    private void detachAndDropCamera() {
+        try {
+            if (serviceBound && videoService != null && rtspCamera != null) {
+                videoService.detachCamera(rtspCamera);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            rtspCamera = null;
         }
     }
 

@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
@@ -17,6 +18,29 @@ import androidx.core.app.NotificationCompat;
 import com.pedro.rtplibrary.rtsp.RtspCamera2;
 
 public class VideoService extends Service {
+
+    // Used by rtspLoop() wait/notify mechanism
+    private final Object stateLock = new Object();
+
+    // Serializes start/stop to avoid MediaCodec "Running state" crashes
+    private final Object streamLock = new Object();
+
+    private enum StreamState { STOPPED, STARTING, STARTED, STOPPING }
+    private volatile StreamState streamState = StreamState.STOPPED;
+
+    // Optional: avoid rapid restart loops
+    private volatile long lastStartAttemptMs = 0;
+    private static final long START_COOLDOWN_MS = 800;
+
+    // GL surface lifecycle actions (sent by MainActivity)
+    public static final String ACTION_GL_SURFACE_READY =
+            "biz.schrottplatz.rudderpi.action.GL_SURFACE_READY";
+
+    public static final String ACTION_GL_SURFACE_GONE =
+            "biz.schrottplatz.rudderpi.action.GL_SURFACE_GONE";
+
+    private boolean glSurfaceReady;
+    private volatile long nextAllowedStartMs = 0; // debounce after surfaceCreated
 
     public static final String PREFS_NAME = "video_service_prefs";
     public static final String PREF_LAST_STATUS = "last_status";
@@ -41,7 +65,6 @@ public class VideoService extends Service {
     private volatile boolean streamRunning  = false;
     private volatile boolean wantReconnect  = false;
 
-    private final Object stateLock = new Object();
 
     private Thread rtspThread;
     private int backoffMs = 1000;
@@ -133,23 +156,29 @@ public class VideoService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        loadRtspSettingsFromPrefs();
-        startReconnectThreadIfNeeded();
 
         if (intent != null && intent.getAction() != null) {
             String action = intent.getAction();
-            if (ACTION_START.equals(action)) {
-                postStatus("VideoService: ACTION_START");
+
+            if (ACTION_GL_SURFACE_READY.equals(action)) {
+                Log.i(TAG, "GL surface READY");
+                glSurfaceReady = true;
+                // Debounce: some devices report surfaceCreated before GL/codec pipeline is stable.
+                nextAllowedStartMs = SystemClock.uptimeMillis() + 600;
                 wantReconnect = true;
-                kickReconnectNow();
-            } else if (ACTION_STOP.equals(action)) {
-                postStatus("VideoService: ACTION_STOP");
+                notifyStateLock();
+            }
+
+            else if (ACTION_GL_SURFACE_GONE.equals(action)) {
+                Log.i(TAG, "GL surface GONE");
+                glSurfaceReady = false;
                 wantReconnect = false;
                 stopStreaming();
             }
         }
 
         return START_STICKY;
+
     }
 
     @Override
@@ -233,6 +262,20 @@ public class VideoService extends Service {
 
             // Do not clear wantReconnect until we actually can attempt a start.
             RtspCamera2 cam = getCamera();
+            // Ensure GL surface is ready before trying to start encoders.
+            if (!glSurfaceReady) {
+                postStatus("RTSP: waiting for GL surface (Activity not ready / screen locked / surface destroyed)");
+                sleepQuiet(250);
+                continue;
+            }
+
+            // Debounce after GL surface becomes ready.
+            long nowMs = SystemClock.uptimeMillis();
+            if (nowMs < nextAllowedStartMs) {
+                sleepQuiet(100);
+                continue;
+            }
+
             if (cam == null) {
                 postStatus("RTSP: camera not attached yet (Activity/GL not ready)");
                 sleepQuiet(500);
@@ -288,35 +331,108 @@ public class VideoService extends Service {
     // Start/Stop streaming
     // ============================================================
 
-    private synchronized boolean startStreaming(String rtspUrl) {
-        if (streamRunning) {
-            postStatus("VideoService: stream already running");
-            return true;
-        }
+    private boolean startStreaming(String rtspUrl) {
+        final RtspCamera2 cam = getCamera();
+        if (cam == null) return false;
+        if (!glSurfaceReady) return false;
 
-        RtspCamera2 cam = getCamera();
-        if (cam == null) {
-            postStatus("VideoService: rtspCamera is null");
-            return false;
-        }
+        synchronized (streamLock) {
+            long now = SystemClock.uptimeMillis();
+            if (now - lastStartAttemptMs < START_COOLDOWN_MS) {
+                postStatus("RTSP: start throttled");
+                return false;
+            }
+            lastStartAttemptMs = now;
 
-        postStatus("VideoService: starting stream to " + rtspUrl);
+            // Don't start if we're already starting/started/stopping
+            if (streamState == StreamState.STARTING || streamState == StreamState.STARTED || streamState == StreamState.STOPPING) {
+                postStatus("RTSP: start ignored (state=" + streamState + ")");
+                return false;
+            }
+            streamState = StreamState.STARTING;
+        }
 
         try {
-            if (!cam.isOnPreview()) {
-                cam.startPreview();
-            }
+            // IMPORTANT: ensure any previous encoder session is fully stopped before starting again.
+            // Some devices can report isStreaming()==false while MediaCodec is still Running.
+            try {
+                if (cam.isStreaming()) {
+                    stopStreamAndWait(cam, 1500);
+                }
+            } catch (Exception ignored) { }
 
+
+            postStatus("VideoService: starting stream to " + rtspUrl);
             cam.startStream(rtspUrl);
 
-            streamRunning = true;
-            updateNotification("Streaming: ON");
+            synchronized (streamLock) {
+                streamState = StreamState.STARTED;
+            }
             return true;
+
         } catch (Exception e) {
+            boolean isEncoderAllocFailure =
+                    (e instanceof NullPointerException)
+                            || (e.getMessage() != null && e.getMessage().contains("MediaCodec.start()"));
+
+            postStatus("RTSP: startStreaming exception: " + e.getClass().getSimpleName() + " " + e.getMessage());
             Log.e(TAG, "startStreaming exception", e);
-            streamRunning = false;
-            safeResetRtspCamera();
+
+            // Always stop/release
+            hardStopAndDropCamera();
+
+            // If encoder allocation failed, back off longer (Qualcomm sometimes needs time)
+            if (isEncoderAllocFailure) {
+                postStatus("RTSP: encoder init failed, cooldown 2000ms");
+                sleepQuiet(2000);
+            } else {
+                sleepQuiet(500);
+            }
+
+            wantReconnect = true;
             return false;
+        }
+    }
+
+    private void hardStopAndDropCamera() {
+        try {
+            RtspCamera2 cam = getCamera();
+            if (cam != null) {
+                try {
+                    if (cam.isStreaming()) cam.stopStream();
+                } catch (Exception ignored) { }
+            }
+        } finally {
+            // IMPORTANT: drop the instance so Activity will attach a fresh one on next surfaceCreated
+            RtspCamera2 cam = getCamera();
+            if (cam != null) {
+                detachCamera(cam);
+            }
+            sleepQuiet(200);
+        }
+    }
+
+    private void stopStreamAndWait(RtspCamera2 cam, long timeoutMs) {
+        if (cam == null) return;
+
+        try {
+            if (cam.isStreaming()) {
+                cam.stopStream();
+            } else {
+                return;
+            }
+        } catch (Exception ignored) {
+            return;
+        }
+
+        long end = SystemClock.uptimeMillis() + timeoutMs;
+        while (SystemClock.uptimeMillis() < end) {
+            try {
+                if (!cam.isStreaming()) break;
+            } catch (Exception ignored) {
+                break;
+            }
+            sleepQuiet(50);
         }
     }
 
@@ -325,31 +441,31 @@ public class VideoService extends Service {
         if (cam == null) return;
 
         try {
-            if (cam.isStreaming()) cam.stopStream();
+            stopStreamAndWait(cam, 1500);
             if (cam.isOnPreview()) cam.stopPreview();
         } catch (Exception ignored) {}
     }
 
-    private synchronized void stopStreaming() {
-        if (!streamRunning) return;
-
-        postStatus("VideoService: stopping stream...");
-
+    private void stopStreaming() {
         RtspCamera2 cam = getCamera();
+
+        synchronized (streamLock) {
+            if (streamState == StreamState.STOPPED || streamState == StreamState.STOPPING) return;
+            streamState = StreamState.STOPPING;
+        }
+
         try {
             if (cam != null) {
-                if (cam.isStreaming()) cam.stopStream();
-                if (cam.isOnPreview()) cam.stopPreview();
+                postStatus("RTSP: stopping stream...");
+                stopStreamAndWait(cam, 1500);
             }
         } catch (Exception e) {
             Log.w(TAG, "stopStreaming exception", e);
         } finally {
-            streamRunning = false;
-            updateNotification("Streaming: OFF");
-            synchronized (stateLock) { stateLock.notifyAll(); }
+            synchronized (streamLock) {
+                streamState = StreamState.STOPPED;
+            }
         }
-
-        postStatus("VideoService: stopped");
     }
 
     // ============================================================
@@ -415,5 +531,14 @@ public class VideoService extends Service {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         nm.notify(NOTIF_ID, buildNotification(text));
     }
+
+    private void notifyStateLock() {
+        synchronized (stateLock) {
+            stateLock.notifyAll();
+        }
+    }
 }
+
+
+
 

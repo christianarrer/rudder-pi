@@ -18,19 +18,20 @@
         android:textColor="@android:color/white"
         android:layout_marginTop="24dp"
         app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintStart_toStartOf="parent" />
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <EditText
         android:id="@+id/inpHTTPServerXAuthHeaderPassword"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:hint="HTTP Server X-Auth Header Password"
-        app:layout_constraintTop_toBottomOf="@id/tvHTTPServerHeader"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
         android:layout_marginTop="12dp"
         android:inputType="text"
-        android:digits="abcdefghijklmnopqrstuvwxyz0123456789" />
+        android:singleLine="true"
+        app:layout_constraintTop_toBottomOf="@id/tvHTTPServerHeader"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <TextView
         android:id="@+id/tvRtspSettingsHeader"
@@ -49,46 +50,59 @@
         android:id="@+id/inpRtspRemoteServerIP4"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:hint="RTSP Remote Upstream Server IPv4"
-        app:layout_constraintTop_toBottomOf="@id/tvRtspSettingsHeader"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
+        android:hint="RTSP Remote Upstream Server IPv4 / Hostname"
         android:layout_marginTop="12dp"
         android:inputType="textUri"
-        android:singleLine="true" />
+        android:singleLine="true"
+        app:layout_constraintTop_toBottomOf="@id/tvRtspSettingsHeader"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <EditText
         android:id="@+id/inpRtspRemoteServerPort"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
         android:hint="RTSP Remote Upstream Server Port"
+        android:layout_marginTop="12dp"
+        android:inputType="number"
+        android:digits="0123456789"
+        android:singleLine="true"
         app:layout_constraintTop_toBottomOf="@id/inpRtspRemoteServerIP4"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        android:digits="0123456789" />
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <Button
         android:id="@+id/btnApplySettings"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:text="Apply all settings"
+        android:layout_marginTop="16dp"
         app:layout_constraintTop_toBottomOf="@id/inpRtspRemoteServerPort"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        android:layout_marginTop="16dp" />
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <Button
+        android:id="@+id/btnAdmin"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:text="Admin: Tethering / Network settings"
+        android:layout_marginTop="12dp"
+        app:layout_constraintTop_toBottomOf="@id/btnApplySettings"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <TextView
         android:id="@+id/tvAppStatusHeader"
-        android:layout_width="wrap_content"
+        android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:text="APP Status (Newest at top)"
         android:textSize="18sp"
         android:textStyle="bold"
         android:textColor="@android:color/white"
         android:layout_marginTop="16dp"
-        app:layout_constraintTop_toBottomOf="@id/btnApplySettings"
-        app:layout_constraintStart_toStartOf="parent" />
+        app:layout_constraintTop_toBottomOf="@id/btnAdmin"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
     <TextView
         android:id="@+id/tvStatus"
@@ -99,16 +113,21 @@
         android:textIsSelectable="true"
         android:textSize="11sp"
         android:textColor="@android:color/white"
-        android:layout_marginTop="12dp"
         android:typeface="monospace"
+        android:layout_marginTop="12dp"
         app:layout_constraintTop_toBottomOf="@id/tvAppStatusHeader"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-  <com.pedro.rtplibrary.view.OpenGlView
-      android:id="@+id/glView"
-      android:layout_width="1dp"
-      android:layout_height="1dp" />
+    <!-- Hidden, only used by the service/library -->
+    <com.pedro.rtplibrary.view.OpenGlView
+        android:id="@+id/glView"
+        android:layout_width="2dp"
+        android:layout_height="2dp"
+        android:alpha="0.0"
+        android:visibility="visible"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
 
