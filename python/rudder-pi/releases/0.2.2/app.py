@@ -690,7 +690,7 @@ MOBILE_CSS = """
 }
 .rp-video {
   width: 100%;
-  aspect-ratio: 16 / 9;
+  aspect-ratio: 4 / 3;
   border: 0;
   border-radius: 14px;
   overflow: hidden;

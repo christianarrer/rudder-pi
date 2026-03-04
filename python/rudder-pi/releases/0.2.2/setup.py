@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """
-Project bootstrap + Raspberry Pi provisioning script.
+Project bootstrap + Raspberry Pi provisioning script (rudder-pi).
 
 Features:
 - Creates a Python venv in ./.venv if it does not exist
 - Upgrades pip inside the venv
-- Inst:contentReference[oaicite:6]{index=6}packages
+- Installs Python requirements
 
 Optional system provisioning (Raspberry Pi):
 - Ensures PWM overlay line exists in config.txt (idempotent)
-- Comments out dtparam=audio=on (optional, idempotent)
+- Comments out dtparam=audio=on (idempotent)
 - Exports PWM channels 0 and 1 via sysfs (idempotent)
 - Optionally installs a systemd oneshot service to export PWM channels at boot (idempotent)
 
-Additional provisioning (v0.2.0+):
+Additional provisioning (v0.2.2):
 - Set hostname to "rudder-pi" (idempotent)
 - Install + enable + start avahi-daemon (mDNS: rudder-pi.local) (idempotent)
 - Install MediaMTX (apt if available, otherwise GitHub release fallback) (idempotent)
 - Ensure MediaMTX config contains:
-    paths:
-      rudderpi:
-        source: publisher
-  (idempotent, safe to run multiple times)
+    - webrtcICEServers2 TURN entry
+    - paths: rudderpiraw and rudderpi (with optional ffmpeg runOnDemand)
 - Install + enable + start mediamtx systemd service (idempotent)
+- Install + enable + start systemd units:
+    - rudder-pi.service (app.py)
+    - rudderpi-ping-lan.timer (LAN keepalive ping)
+    - rudderpi-provision-ip.timer (retry phone IP provisioning)
+- Ensure default systemd target is multi-user.target (no GUI by default)
 
 Usage:
     python3 setup.py
@@ -37,7 +40,7 @@ import argparse
 import os
 import platform
 import re
-import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -91,19 +94,118 @@ MEDIAMTX_CONFIG = MEDIAMTX_ETC_DIR / "mediamtx.yml"
 MEDIAMTX_SERVICE_NAME = "mediamtx.service"
 MEDIAMTX_SERVICE_PATH = Path("/etc/systemd/system") / MEDIAMTX_SERVICE_NAME
 
+# MediaMTX hardcoded version (stable known-good)
+MEDIAMTX_VERSION = "v1.16.0"
+
 # This is the YAML fragment we want to exist in the config file.
+MEDIAMTX_WEBRTC_ICE_FRAGMENT = (
+    "webrtcICEServers2:\n"
+    "  - url: turn:rudder-pi-webrtc.schrottplatz.internal:3478?transport=udp\n"
+    "    username: rudderpi\n"
+    "    password: rudderpi42\n"
+)
+
 MEDIAMTX_PATHS_FRAGMENT = (
     "paths:\n"
+    "  rudderpiraw:\n"
+    "    source: publisher\n"
+    "\n"
     "  rudderpi:\n"
     "    source: publisher\n"
+    "    runOnDemand: >\n"
+    "      ffmpeg -hide_banner -loglevel warning -rtsp_transport tcp "
+    "-i rtsp://127.0.0.1:8554/rudderpiraw -an -vf \"transpose=1\" "
+    "-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p "
+    "-g 30 -keyint_min 30 -b:v 1000k -maxrate 1800k -bufsize 6000k "
+    "-f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/rudderpi\n"
+    "    runOnDemandRestart: yes\n"
 )
-# MediaMTX hardcoded download (stable known-good)
-MEDIAMTX_VERSION = "v1.16.0"
-MEDIAMTX_ARCH = "linux_arm64"   # or linux_armv7, linux_amd64
-MEDIAMTX_URL = (
-    f"https://github.com/bluenviron/mediamtx/releases/download/"
-    f"{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_{MEDIAMTX_ARCH}.tar.gz"
-)
+
+SYSTEMD_DIR = Path("/etc/systemd/system")
+
+RUDDER_PI_SERVICE = """\
+[Unit]
+Description=Rudder Pi Service
+Wants=network-online.target
+After=network-online.target
+After=wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/opt/rudder-pi
+
+# Optional: don't fail if env file is missing (leading "-")
+EnvironmentFile=-/opt/rudder-pi/env
+
+# Ensure immediate logs in journalctl and predictable behavior
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/rudder-pi/.venv/bin/python -u /opt/rudder-pi/app.py
+
+Restart=on-failure
+RestartSec=2
+
+# Optional hardening (adjust if needed)
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+RUDDERPI_PING_LAN_SERVICE = """\
+[Unit]
+Description=Keep LAN connection alive by pinging 192.168.21.80
+
+[Service]
+Type=oneshot
+ExecStart=/bin/ping -c 1 -W 1 192.168.21.80
+"""
+
+RUDDERPI_PING_LAN_TIMER = """\
+[Unit]
+Description=Run rudderpi-ping-lan.service every 20 seconds
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=20
+AccuracySec=1s
+Persistent=true
+Unit=rudderpi-ping-lan.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+RUDDERPI_PROVISION_IP_SERVICE = """\
+[Unit]
+Description=Provision eth0 IP to Android phone (rudder-pi)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rudder-pi/provision-phone-ip.sh
+"""
+
+RUDDERPI_PROVISION_IP_TIMER = """\
+[Unit]
+Description=Retry IP provisioning to phone
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=20
+AccuracySec=2s
+Persistent=true
+Unit=rudderpi-provision-ip.service
+
+[Install]
+WantedBy=timers.target
+"""
 
 
 def run(cmd: list[str], *, check: bool = True, capture: bool = False, text: bool = True) -> subprocess.CompletedProcess:
@@ -113,10 +215,6 @@ def run(cmd: list[str], *, check: bool = True, capture: bool = False, text: bool
 
 def sudo_run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
     return run(["sudo", *cmd], check=check, capture=capture)
-
-
-def is_root() -> bool:
-    return os.geteuid() == 0
 
 
 def detect_config_path() -> Path:
@@ -135,11 +233,23 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def write_text_atomic_as_root(path: Path, content: str) -> None:
+def write_text_atomic_as_root(path: Path, content: str) -> bool:
+    """
+    Write file as root, but only if content differs.
+    Creates a one-time .bak copy of the original file.
+    Returns True if the file was changed.
+    """
+    existing = ""
+    if path.exists():
+        existing = read_text(path)
+        if existing == content:
+            return False
+
     backup = Path(str(path) + ".bak")
     if path.exists() and not backup.exists():
         sudo_run(["cp", "-a", str(path), str(backup)])
 
+    # Atomic-ish replace using tee (sufficient for small config/unit files).
     p = subprocess.Popen(["sudo", "tee", str(path)], stdin=subprocess.PIPE, text=True)
     assert p.stdin is not None
     p.stdin.write(content)
@@ -147,6 +257,45 @@ def write_text_atomic_as_root(path: Path, content: str) -> None:
     rc = p.wait()
     if rc != 0:
         raise subprocess.CalledProcessError(rc, ["sudo", "tee", str(path)])
+
+    return True
+
+
+def systemd_daemon_reload() -> None:
+    sudo_run(["systemctl", "daemon-reload"])
+
+
+def systemd_enable_now(unit: str) -> None:
+    sudo_run(["systemctl", "enable", "--now", unit])
+
+
+def ensure_systemd_unit(unit_name: str, content: str) -> bool:
+    """
+    Ensure /etc/systemd/system/<unit_name> matches content.
+    Returns True if changed.
+    """
+    unit_path = SYSTEMD_DIR / unit_name
+    changed = write_text_atomic_as_root(unit_path, content.rstrip() + "\n")
+    if changed:
+        print(f"✅ Installed/updated {unit_path}")
+    else:
+        print(f"✅ {unit_path} already up-to-date")
+    return changed
+
+
+def ensure_default_target_multi_user() -> bool:
+    """
+    Ensure the default systemd target is multi-user.target (no GUI by default).
+    Returns True if changed.
+    """
+    current = run(["systemctl", "get-default"], capture=True).stdout.strip()
+    if current == "multi-user.target":
+        print("✅ Default systemd target already multi-user.target")
+        return False
+
+    print(f"🔧 Changing default systemd target: {current} -> multi-user.target")
+    sudo_run(["systemctl", "set-default", "multi-user.target"])
+    return True
 
 
 def ensure_pwm_overlay_in_config(config_path: Path) -> Tuple[bool, bool]:
@@ -167,7 +316,7 @@ def ensure_pwm_overlay_in_config(config_path: Path) -> Tuple[bool, bool]:
         changed = True
         reboot_recommended = True
 
-    new_lines = []
+    new_lines: list[str] = []
     for line in lines:
         if line.strip() == AUDIO_PARAM_LINE:
             new_lines.append("# " + line)
@@ -176,7 +325,7 @@ def ensure_pwm_overlay_in_config(config_path: Path) -> Tuple[bool, bool]:
         else:
             new_lines.append(line)
 
-    new_content = "\n".join(new_lines) + "\n"
+    new_content = "\n".join(new_lines).rstrip() + "\n"
     if changed:
         write_text_atomic_as_root(config_path, new_content)
 
@@ -210,7 +359,7 @@ def export_pwm_channels(pwmchip: Path, channels: list[int]) -> bool:
             continue
         if not export_path.exists():
             raise RuntimeError(f"Export path does not exist: {export_path}")
-        sudo_run(["bash", "-lc", f"echo {ch} > {export_path}"])
+        sudo_run(["bash", "-lc", f"echo {ch} > {shlex.quote(str(export_path))}"])
         print(f"✅ Exported channel {ch} at {pwmchip}")
         changed = True
     return changed
@@ -233,20 +382,13 @@ ExecStart=/bin/bash -lc 'CHIP="{pwmchip}"; \
 [Install]
 WantedBy=multi-user.target
 """
-    changed = False
-    existing = read_text(SYSTEMD_PWM_SERVICE_PATH) if SYSTEMD_PWM_SERVICE_PATH.exists() else ""
-    if existing != service_content:
-        p = subprocess.Popen(["sudo", "tee", str(SYSTEMD_PWM_SERVICE_PATH)], stdin=subprocess.PIPE, text=True)
-        assert p.stdin is not None
-        p.stdin.write(service_content)
-        p.stdin.close()
-        rc = p.wait()
-        if rc != 0:
-            raise subprocess.CalledProcessError(rc, ["sudo", "tee", str(SYSTEMD_PWM_SERVICE_PATH)])
-        changed = True
+    changed = write_text_atomic_as_root(SYSTEMD_PWM_SERVICE_PATH, service_content.rstrip() + "\n")
+    if changed:
         print(f"✅ Wrote systemd service: {SYSTEMD_PWM_SERVICE_PATH}")
+    else:
+        print(f"✅ Systemd service already up-to-date: {SYSTEMD_PWM_SERVICE_PATH}")
 
-    sudo_run(["systemctl", "daemon-reload"])
+    systemd_daemon_reload()
     sudo_run(["systemctl", "enable", SYSTEMD_PWM_SERVICE_NAME])
     print(f"✅ Enabled systemd service: {SYSTEMD_PWM_SERVICE_NAME}")
     return changed
@@ -297,7 +439,6 @@ def apt_install(pkgs: list[str]) -> bool:
     Returns True if anything was installed (best-effort).
     """
     sudo_run(["apt-get", "update"])
-    # apt-get install is idempotent; we don't try to detect changes precisely.
     sudo_run(["apt-get", "install", "-y", *pkgs])
     return True
 
@@ -306,7 +447,7 @@ def ensure_hostname(target: str) -> bool:
     """
     Ensure the system hostname matches target and persists across reboots.
 
-    Handles cloud-init setups (common on some images) by:
+    Handles cloud-init setups by writing:
       - preserve_hostname: true
       - manage_etc_hosts: false
 
@@ -318,7 +459,6 @@ def ensure_hostname(target: str) -> bool:
     """
     changed = False
 
-    # 1) Ensure cloud-init won't revert hostname / hosts
     cloud_cfg_dir = Path("/etc/cloud/cloud.cfg.d")
     cloud_cfg_path = cloud_cfg_dir / "99-rudderpi-hostname.cfg"
     desired_cloud_cfg = "preserve_hostname: true\nmanage_etc_hosts: false\n"
@@ -330,7 +470,6 @@ def ensure_hostname(target: str) -> bool:
         print(f"✅ Wrote cloud-init override: {cloud_cfg_path}")
         changed = True
 
-    # 2) Set runtime/static hostname
     current = run(["hostnamectl", "--static"], check=True, capture=True).stdout.strip()
     if current != target:
         print(f"🔧 Changing hostname: '{current}' -> '{target}'")
@@ -339,7 +478,6 @@ def ensure_hostname(target: str) -> bool:
     else:
         print(f"✅ Hostname already '{target}'")
 
-    # 3) Ensure /etc/hostname persists
     hostname_path = Path("/etc/hostname")
     existing_hostname = read_text(hostname_path).strip() if hostname_path.exists() else ""
     if existing_hostname != target:
@@ -347,9 +485,8 @@ def ensure_hostname(target: str) -> bool:
         print("✅ Updated /etc/hostname")
         changed = True
 
-    # 4) Fix /etc/hosts to avoid sudo 'unable to resolve host ...' warnings
     hosts_path = Path("/etc/hosts")
-    hosts = read_text(hosts_path)
+    hosts = read_text(hosts_path) if hosts_path.exists() else ""
     lines = hosts.splitlines()
 
     new_lines: list[str] = []
@@ -357,13 +494,11 @@ def ensure_hostname(target: str) -> bool:
     for line in lines:
         if line.strip().startswith("127.0.1.1"):
             found_127_0_1_1 = True
-            # Replace the full line with a stable mapping.
             new_lines.append(f"127.0.1.1\t{target}")
         else:
             new_lines.append(line)
 
     if not found_127_0_1_1:
-        # Add a Debian-style hostname mapping if missing
         new_lines.append(f"127.0.1.1\t{target}")
 
     new_hosts = "\n".join(new_lines).rstrip() + "\n"
@@ -378,25 +513,16 @@ def ensure_hostname(target: str) -> bool:
     return changed
 
 
-
 def ensure_avahi() -> bool:
     """
     Ensure avahi-daemon is installed and running (mDNS: hostname.local).
-    Returns True if we made changes (best-effort).
+    Returns True if changes were made (best-effort).
     """
     print("📦 Ensuring avahi-daemon is installed")
     apt_install(["avahi-daemon", "libnss-mdns"])
 
     print("✅ Enabling + starting avahi-daemon")
     sudo_run(["systemctl", "enable", "--now", "avahi-daemon"])
-
-    # Ensure avahi daemon uses hostname (defaults usually OK; keep minimal edits)
-    conf = Path("/etc/avahi/avahi-daemon.conf")
-    if conf.exists():
-        txt = read_text(conf)
-        # Ensure 'use-ipv4=yes' and 'use-ipv6=yes' not touched; we only ensure publish settings.
-        # Keep this minimal to avoid surprising config changes.
-        return True
     return True
 
 
@@ -414,15 +540,20 @@ def _machine_arch_for_mediamtx() -> str:
     raise RuntimeError(f"Unsupported architecture for MediaMTX auto-install: {m}")
 
 
+def _mediamtx_url() -> str:
+    arch = _machine_arch_for_mediamtx()
+    return (
+        f"https://github.com/bluenviron/mediamtx/releases/download/"
+        f"{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_{arch}.tar.gz"
+    )
+
+
 def _download_mediamtx_tarball(dest: Path) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / "mediamtx.tar.gz"
+    url = _mediamtx_url()
 
-    sudo_run([
-        "bash", "-lc",
-        f"curl -fL '{MEDIAMTX_URL}' -o '{out}'"
-    ])
-
+    sudo_run(["bash", "-lc", f"curl -fL {shlex.quote(url)} -o {shlex.quote(str(out))}"])
     return out
 
 
@@ -437,16 +568,13 @@ def ensure_mediamtx_installed() -> bool:
         return False
 
     print("📦 Trying to install mediamtx via apt (if available)")
-    # Best-effort: apt package may not exist on all RPi OS repos.
     apt_ok = True
     try:
         sudo_run(["apt-get", "update"])
-        # --no-install-recommends keeps it lean
         sudo_run(["apt-get", "install", "-y", "--no-install-recommends", "mediamtx"])
     except subprocess.CalledProcessError:
         apt_ok = False
 
-    # Some distros might install to /usr/bin/mediamtx
     if apt_ok:
         for candidate in (Path("/usr/bin/mediamtx"), Path("/usr/local/bin/mediamtx"), Path("/bin/mediamtx")):
             if candidate.exists():
@@ -462,7 +590,6 @@ def ensure_mediamtx_installed() -> bool:
         extract_dir = td_path / "extract"
         extract_dir.mkdir(parents=True, exist_ok=True)
 
-        # Extract tarball
         with tarfile.open(tgz, "r:gz") as tf:
             tf.extractall(path=extract_dir)
 
@@ -472,11 +599,9 @@ def ensure_mediamtx_installed() -> bool:
         if not extracted_bin.exists():
             raise RuntimeError("Downloaded tarball did not contain 'mediamtx' binary")
 
-        # Install binary
         sudo_run(["install", "-m", "0755", str(extracted_bin), str(MEDIAMTX_BIN)])
         print(f"✅ Installed MediaMTX binary to {MEDIAMTX_BIN}")
 
-        # Seed config dir if missing; keep original as reference
         sudo_run(["mkdir", "-p", str(MEDIAMTX_ETC_DIR)])
         if extracted_cfg.exists() and not MEDIAMTX_CONFIG.exists():
             sudo_run(["install", "-m", "0644", str(extracted_cfg), str(MEDIAMTX_CONFIG)])
@@ -485,62 +610,121 @@ def ensure_mediamtx_installed() -> bool:
     return True
 
 
+def _replace_or_insert_top_level_block(
+    existing: str,
+    *,
+    key: str,
+    desired_block: str,
+    insert_after_key: str | None = None,
+) -> tuple[str, bool]:
+    """
+    Replace an existing top-level YAML block (e.g. 'paths:' or 'webrtcICEServers2:')
+    with desired_block, or insert it if missing.
+
+    Assumptions (good enough for mediamtx.yml):
+    - Top-level keys start at column 0: r'^[A-Za-z0-9_]+:'
+    - A block runs until the next top-level key or EOF.
+    """
+    block_re = re.compile(
+        rf"(?ms)^(?P<block>{re.escape(key)}:\n.*?)(?=^[A-Za-z0-9_]+:\s*$|\Z)"
+    )
+
+    m = block_re.search(existing)
+    if m:
+        current_block = m.group("block")
+        if current_block == desired_block:
+            return existing, False
+        new = existing[: m.start("block")] + desired_block + existing[m.end("block") :]
+        return new, True
+
+    if insert_after_key:
+        anchor_re = re.compile(rf"(?m)^{re.escape(insert_after_key)}:\s*$")
+        am = anchor_re.search(existing)
+        if am:
+            insert_pos = existing.find("\n", am.end()) + 1
+            if insert_pos <= 0:
+                insert_pos = am.end()
+            sep = "" if existing[:insert_pos].endswith("\n\n") else "\n"
+            new = existing[:insert_pos] + sep + desired_block + "\n" + existing[insert_pos:]
+            return new, True
+
+    sep = "" if existing.endswith("\n") else "\n"
+    new = existing + sep + "\n" + desired_block
+    return new, True
+
+
 def ensure_mediamtx_config_paths() -> bool:
-    """
-    Ensure mediamtx.yml contains:
-      paths:
-        rudderpi:
-          source: publisher
-    Idempotent text-based patch (no YAML dependency).
-    Returns True if changed.
-    """
     sudo_run(["mkdir", "-p", str(MEDIAMTX_ETC_DIR)])
 
-    existing = ""
-    if MEDIAMTX_CONFIG.exists():
-        existing = read_text(MEDIAMTX_CONFIG)
+    existing = read_text(MEDIAMTX_CONFIG) if MEDIAMTX_CONFIG.exists() else ""
+    new_content, changed = _replace_or_insert_top_level_block(
+        existing,
+        key="paths",
+        desired_block=MEDIAMTX_PATHS_FRAGMENT,
+        insert_after_key=None,
+    )
 
-    if "paths:" not in existing:
-        # Append a minimal paths section
-        new_content = (existing.rstrip() + "\n\n" + MEDIAMTX_PATHS_FRAGMENT)
-        write_text_atomic_as_root(MEDIAMTX_CONFIG, new_content)
-        print(f"✅ Added paths section to {MEDIAMTX_CONFIG}")
-        return True
+    if changed:
+        write_text_atomic_as_root(MEDIAMTX_CONFIG, new_content.rstrip() + "\n")
+        print("✅ Patched MediaMTX config: paths")
+    else:
+        print("✅ MediaMTX paths already configured")
 
-    # If paths exists, ensure rudderpi block exists under it.
-    if re.search(r"(?m)^\s{2}rudderpi:\s*$", existing) and re.search(r"(?m)^\s{4}source:\s*publisher\s*$", existing):
-        print("✅ MediaMTX paths.rudderpi.source already configured")
-        return False
+    return changed
 
-    # Insert rudderpi block right after the first 'paths:' line if not present
-    lines = existing.splitlines()
-    out_lines: list[str] = []
-    inserted = False
-    for i, line in enumerate(lines):
-        out_lines.append(line)
-        if not inserted and line.strip() == "paths:":
-            # Insert our block only if rudderpi is not already present anywhere
-            if not re.search(r"(?m)^\s{2}rudderpi:\s*$", existing):
-                out_lines.append("  rudderpi:")
-                out_lines.append("    source: publisher")
-                inserted = True
 
-    new_content = "\n".join(out_lines).rstrip() + "\n"
-    if new_content != existing:
-        write_text_atomic_as_root(MEDIAMTX_CONFIG, new_content)
-        print(f"✅ Patched {MEDIAMTX_CONFIG} to include paths.rudderpi.source=publisher")
-        return True
+def _count_top_level_key_occurrences(text: str, key: str) -> int:
+    return len(re.findall(rf"(?m)^{re.escape(key)}:\s*$", text))
 
-    print("✅ MediaMTX config already OK (no changes)")
-    return False
+
+def _remove_all_but_first_top_level_block(text: str, key: str) -> tuple[str, bool]:
+    """
+    Remove duplicate top-level YAML blocks, keeping the first occurrence.
+    Returns (new_text, changed).
+    """
+    # Find all block ranges
+    block_re = re.compile(
+        rf"(?ms)^(?P<block>{re.escape(key)}:\s*\n.*?)(?=^[A-Za-z0-9_]+:\s*$|\Z)"
+    )
+
+    matches = list(block_re.finditer(text))
+    if len(matches) <= 1:
+        return text, False
+
+    # Keep the first, remove the rest from end to start to preserve indices
+    new = text
+    for m in reversed(matches[1:]):
+        new = new[: m.start("block")] + new[m.end("block") :]
+    return new, True
+
+
+def ensure_mediamtx_config_webrtc_ice_servers() -> bool:
+    sudo_run(["mkdir", "-p", str(MEDIAMTX_ETC_DIR)])
+
+    existing = read_text(MEDIAMTX_CONFIG) if MEDIAMTX_CONFIG.exists() else ""
+
+    # 1) Deduplicate if the key exists multiple times (prevents MediaMTX crash)
+    deduped, dedup_changed = _remove_all_but_first_top_level_block(existing, "webrtcICEServers2")
+
+    # 2) Replace or insert the (single) block with our desired content
+    new_content, replaced_changed = _replace_or_insert_top_level_block(
+        deduped,
+        key="webrtcICEServers2",
+        desired_block=MEDIAMTX_WEBRTC_ICE_FRAGMENT,
+        insert_after_key=None,
+    )
+
+    changed = dedup_changed or replaced_changed
+    if changed:
+        write_text_atomic_as_root(MEDIAMTX_CONFIG, new_content.rstrip() + "\n")
+        print("✅ Patched MediaMTX config: webrtcICEServers2 (deduplicated + ensured)")
+    else:
+        print("✅ MediaMTX webrtcICEServers2 already configured")
+
+    return changed
 
 
 def ensure_mediamtx_service() -> bool:
-    """
-    Ensure systemd service exists, enabled, and started.
-    Runs mediamtx with explicit config path.
-    Returns True if changed.
-    """
     service_content = f"""[Unit]
 Description=MediaMTX (rudder-pi)
 After=network-online.target
@@ -556,27 +740,56 @@ User=root
 [Install]
 WantedBy=multi-user.target
 """
-    changed = False
-    existing = read_text(MEDIAMTX_SERVICE_PATH) if MEDIAMTX_SERVICE_PATH.exists() else ""
-    if existing != service_content:
-        p = subprocess.Popen(["sudo", "tee", str(MEDIAMTX_SERVICE_PATH)], stdin=subprocess.PIPE, text=True)
-        assert p.stdin is not None
-        p.stdin.write(service_content)
-        p.stdin.close()
-        rc = p.wait()
-        if rc != 0:
-            raise subprocess.CalledProcessError(rc, ["sudo", "tee", str(MEDIAMTX_SERVICE_PATH)])
-        changed = True
+    changed = write_text_atomic_as_root(MEDIAMTX_SERVICE_PATH, service_content.rstrip() + "\n")
+    if changed:
         print(f"✅ Wrote systemd service: {MEDIAMTX_SERVICE_PATH}")
+        systemd_daemon_reload()
 
-    sudo_run(["systemctl", "daemon-reload"])
     sudo_run(["systemctl", "enable", "--now", MEDIAMTX_SERVICE_NAME])
     print("✅ Enabled + started mediamtx")
     return changed
 
 
+def ensure_rudder_pi_app_service() -> bool:
+    # Soft checks (helps troubleshooting when installed elsewhere than /opt/rudder-pi)
+    if not Path("/opt/rudder-pi/app.py").exists():
+        print("⚠️  /opt/rudder-pi/app.py not found. If you installed elsewhere, adjust the systemd unit paths.")
+    if not Path("/opt/rudder-pi/.venv/bin/python").exists():
+        print("⚠️  /opt/rudder-pi/.venv/bin/python not found. Ensure the venv exists under /opt/rudder-pi/.venv.")
+
+    changed = ensure_systemd_unit("rudder-pi.service", RUDDER_PI_SERVICE)
+    if changed:
+        systemd_daemon_reload()
+    systemd_enable_now("rudder-pi.service")
+    return changed
+
+
+def ensure_rudderpi_ping_lan_timer() -> bool:
+    changed_svc = ensure_systemd_unit("rudderpi-ping-lan.service", RUDDERPI_PING_LAN_SERVICE)
+    changed_tmr = ensure_systemd_unit("rudderpi-ping-lan.timer", RUDDERPI_PING_LAN_TIMER)
+    if changed_svc or changed_tmr:
+        systemd_daemon_reload()
+    systemd_enable_now("rudderpi-ping-lan.timer")
+    return changed_svc or changed_tmr
+
+
+def ensure_rudderpi_provision_ip_timer() -> bool:
+    if not Path("/opt/rudder-pi/provision-phone-ip.sh").exists():
+        print("⚠️  /opt/rudder-pi/provision-phone-ip.sh not found. If you installed elsewhere, adjust the systemd unit paths.")
+
+    changed_svc = ensure_systemd_unit("rudderpi-provision-ip.service", RUDDERPI_PROVISION_IP_SERVICE)
+    changed_tmr = ensure_systemd_unit("rudderpi-provision-ip.timer", RUDDERPI_PROVISION_IP_TIMER)
+    if changed_svc or changed_tmr:
+        systemd_daemon_reload()
+    systemd_enable_now("rudderpi-provision-ip.timer")
+    return changed_svc or changed_tmr
+
+
 def system_provision(install_pwm_service: bool, reboot: bool) -> None:
     reboot_recommended = False
+
+    # 0) Default target: multi-user.target (no GUI)
+    changed_target = ensure_default_target_multi_user()
 
     # 1) Hostname + Avahi (mDNS)
     changed_host = ensure_hostname(TARGET_HOSTNAME)
@@ -617,11 +830,21 @@ def system_provision(install_pwm_service: bool, reboot: bool) -> None:
         print("ℹ️  Skipping PWM export service install (use --install-pwm-export-service)")
 
     # 3) MediaMTX
-    changed_mtx = ensure_mediamtx_installed()
-    changed_mtx_cfg = ensure_mediamtx_config_paths()
+    changed_mtx_install = ensure_mediamtx_installed()
+    changed_mtx_cfg_paths = ensure_mediamtx_config_paths()
+    changed_mtx_cfg_ice = ensure_mediamtx_config_webrtc_ice_servers()
     changed_mtx_svc = ensure_mediamtx_service()
 
-    any_changes = changed_host or changed_cfg or changed_export or changed_pwm_svc or changed_mtx or changed_mtx_cfg or changed_mtx_svc
+    # 4) rudder-pi + helper services
+    changed_app_svc = ensure_rudder_pi_app_service()
+    changed_ping = ensure_rudderpi_ping_lan_timer()
+    changed_prov = ensure_rudderpi_provision_ip_timer()
+
+    any_changes = (
+        changed_target or changed_host or changed_cfg or changed_export or changed_pwm_svc
+        or changed_mtx_install or changed_mtx_cfg_paths or changed_mtx_cfg_ice or changed_mtx_svc
+        or changed_app_svc or changed_ping or changed_prov
+    )
 
     if reboot_recommended:
         print("♻️  Reboot is recommended (hostname and/or overlay changes).")
@@ -639,7 +862,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--system",
         action="store_true",
-        help="Apply Raspberry Pi system changes (hostname+avahi+mediamtx+config.txt + PWM export). Requires sudo.",
+        help="Apply Raspberry Pi system changes (hostname+avahi+mediamtx+config.txt + PWM export + services). Requires sudo.",
     )
     p.add_argument(
         "--install-pwm-export-service",
