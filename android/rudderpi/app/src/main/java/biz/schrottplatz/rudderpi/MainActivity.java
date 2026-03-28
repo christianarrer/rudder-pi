@@ -218,6 +218,20 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        Button btnRestart = findViewById(R.id.btnRestartApp);
+        btnRestart.setOnClickListener(v -> {
+            addStatusLine("Restarting app...");
+
+            Intent intent = getPackageManager().getLaunchIntentForPackage(getPackageName());
+            if (intent != null) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(intent);
+            }
+
+            // kill current process
+            android.os.Process.killProcess(android.os.Process.myPid());
+        });
+
         restoreLastStatus();
         registerStatusReceiver();
 
