@@ -197,10 +197,9 @@ RUDDERPI_PROVISION_IP_TIMER = """\
 Description=Retry IP provisioning to phone
 
 [Timer]
-OnBootSec=10
-OnUnitActiveSec=20
+OnBootSec=15s
+OnActiveSec=20s
 AccuracySec=2s
-Persistent=true
 Unit=rudderpi-provision-ip.service
 
 [Install]
