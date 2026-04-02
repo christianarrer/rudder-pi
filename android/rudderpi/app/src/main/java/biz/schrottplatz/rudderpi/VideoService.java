@@ -12,12 +12,20 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.Log;
-
+import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import com.pedro.rtplibrary.rtsp.RtspCamera2;
 
 public class VideoService extends Service {
+
+    private static volatile VideoService INSTANCE;
+
+    private volatile boolean torchEnabled = false;
+
+    public static @Nullable VideoService getInstance() {
+        return INSTANCE;
+    }
 
     // Used by rtspLoop() wait/notify mechanism
     private final Object stateLock = new Object();
@@ -142,6 +150,7 @@ public class VideoService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        INSTANCE = this;
         RUNNING = true;
 
         createNotifChannel();
@@ -184,6 +193,7 @@ public class VideoService extends Service {
     @Override
     public void onDestroy() {
         postStatus("VideoService: onDestroy()");
+        INSTANCE = null;
         stopServiceAndThread();
         RUNNING = false;
         super.onDestroy();
@@ -206,6 +216,7 @@ public class VideoService extends Service {
         synchronized (cameraLock) {
             if (this.rtspCamera == camera) {
                 this.rtspCamera = null;
+                torchEnabled = false;
             }
         }
     }
@@ -536,6 +547,35 @@ public class VideoService extends Service {
         synchronized (stateLock) {
             stateLock.notifyAll();
         }
+    }
+
+    public synchronized boolean setTorchEnabled(boolean enabled) {
+        RtspCamera2 cam = getCamera();
+        if (cam == null) {
+            Log.w(TAG, "Torch: camera not attached");
+            return false;
+        }
+
+        try {
+            if (enabled) {
+                cam.enableLantern();
+                torchEnabled = true;
+                postStatus("Torch: on");
+            } else {
+                cam.disableLantern();
+                torchEnabled = false;
+                postStatus("Torch: off");
+            }
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Torch toggle failed", e);
+            postStatus("Torch failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public synchronized boolean isTorchEnabled() {
+        return torchEnabled;
     }
 }
 

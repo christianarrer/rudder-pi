@@ -11,6 +11,8 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
@@ -57,6 +59,8 @@ public class TelemetryService extends Service implements SensorEventListener {
     private LocationManager locationManager;
 
     private RtspCamera2 rtspCamera;
+
+    private boolean torchEnabled = false;
 
 
 
@@ -395,5 +399,19 @@ public class TelemetryService extends Service implements SensorEventListener {
     @Override
     public IBinder onBind(Intent intent) {
         return null; // kein Binding nötig
+    }
+
+    public synchronized boolean setTorchEnabled(boolean enabled) {
+        VideoService vs = VideoService.getInstance();
+        if (vs == null) {
+            Log.w("TORCH", "VideoService not running");
+            return false;
+        }
+        return vs.setTorchEnabled(enabled);
+    }
+
+    public synchronized boolean isTorchEnabled() {
+        VideoService vs = VideoService.getInstance();
+        return vs != null && vs.isTorchEnabled();
     }
 }

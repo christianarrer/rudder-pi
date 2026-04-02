@@ -75,6 +75,38 @@ public class HttpServer extends NanoHTTPD {
                     "{\"ok\":true,\"running\":" + running + "}");
         }
 
+        // --- TORCH CONTROL ---
+        if ("/torch/on".equals(session.getUri()) && Method.POST.equals(session.getMethod())) {
+            boolean ok = telemetryService.setTorchEnabled(true);
+            return newFixedLengthResponse(
+                    ok ? Response.Status.OK : Response.Status.INTERNAL_ERROR,
+                    "application/json",
+                    ok
+                            ? "{\"ok\":true,\"torch\":\"on\"}"
+                            : "{\"ok\":false,\"error\":\"torch_failed\"}"
+            );
+        }
+
+        if ("/torch/off".equals(session.getUri()) && Method.POST.equals(session.getMethod())) {
+            boolean ok = telemetryService.setTorchEnabled(false);
+            return newFixedLengthResponse(
+                    ok ? Response.Status.OK : Response.Status.INTERNAL_ERROR,
+                    "application/json",
+                    ok
+                            ? "{\"ok\":true,\"torch\":\"off\"}"
+                            : "{\"ok\":false,\"error\":\"torch_failed\"}"
+            );
+        }
+
+        if ("/torch/status".equals(session.getUri()) && Method.GET.equals(session.getMethod())) {
+            boolean enabled = telemetryService.isTorchEnabled();
+            return newFixedLengthResponse(
+                    Response.Status.OK,
+                    "application/json",
+                    "{\"ok\":true,\"enabled\":" + enabled + "}"
+            );
+        }
+
         if ("/rudder-pi/ip".equals(session.getUri()) && Method.POST.equals(session.getMethod())) {
 
             Map<String, String> files = new HashMap<>();
