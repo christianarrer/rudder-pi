@@ -466,6 +466,38 @@ def get_state_pretty() -> str:
         return f"Zeit: {stamp}\n\n" + json.dumps(snap["data"], indent=2, ensure_ascii=False)
     return f"Zeit: {stamp}\n\nERROR: {snap.get('error')}"
 
+def derive_base_url_from_state_url(state_url: str) -> str:
+    url = (state_url or "").strip()
+    if not url:
+        return ""
+    if url.endswith("/state.json"):
+        return url[:-len("/state.json")]
+    return url.rstrip("/")
+
+
+def torch_action(state_url: str, pw: str, turn_on: bool) -> str:
+    try:
+        base_url = derive_base_url_from_state_url(state_url)
+        if not base_url:
+            return "⚠️ Keine gültige State URL gesetzt."
+
+        endpoint = f"{base_url}/torch/on" if turn_on else f"{base_url}/torch/off"
+        headers = {"X-Auth": pw} if pw else {}
+
+        r = requests.post(endpoint, headers=headers, timeout=3.0)
+        r.raise_for_status()
+
+        try:
+            data = r.json()
+        except Exception:
+            return f"⚠️ Torch-Request ok, aber Antwort war kein JSON ({r.status_code})."
+
+        if data.get("ok"):
+            return "🔦 Torch eingeschaltet." if turn_on else "🌑 Torch ausgeschaltet."
+        return f"⚠️ Torch-Request fehlgeschlagen: {data}"
+
+    except Exception as e:
+        return f"ERROR Torch: {e}"
 
 # =========================
 # Soft-ramp PWM controller
@@ -807,6 +839,8 @@ def app() -> gr.Blocks:
                     steer.change(set_targets_from_ui, inputs=[session_id, gas, steer], outputs=[pwm_status])
                     btn_stop.click(pwm_stop, inputs=[session_id], outputs=[pwm_status])
 
+ 
+
                     # Live state.json
                     gr.Markdown("### state.json (live)")
                     state_url = gr.Textbox(label="State URL", value=STATE_URL, max_lines=1)
@@ -840,6 +874,26 @@ def app() -> gr.Blocks:
 
                     demo.load(on_load, outputs=[state_text])
                     state_timer.tick(lambda: get_state_pretty(), outputs=[state_text])
+                    
+                    gr.Markdown("### Torch")
+
+                    with gr.Row():
+                        btn_torch_on = gr.Button("🔦 Torch ON")
+                        btn_torch_off = gr.Button("🌑 Torch OFF")
+
+                    torch_status = gr.Markdown("")
+                    
+                    btn_torch_on.click(
+                        lambda url, pw: torch_action(url, pw, True),
+                        inputs=[state_url, xauth_pw],
+                        outputs=[torch_status],
+                    )
+
+                    btn_torch_off.click(
+                        lambda url, pw: torch_action(url, pw, False),
+                        inputs=[state_url, xauth_pw],
+                        outputs=[torch_status],
+                    )
 
                 with gr.Tab("Auto"):
                     gr.Markdown("Hier kommt später der Autopilot rein (Heading-Hold, Waypoints, Safety, Logs).")
